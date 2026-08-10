@@ -30,7 +30,7 @@ from google.oauth2.service_account import Credentials
 # --- RAILWAY VA GOOGLE SHEETS SOZLAMALARI ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON")
-SHEET_NAME = "test"
+SHEET_NAME = "Olimpiada"
 
 SUPER_ADMIN_IDS = [8317043750]
 
@@ -128,7 +128,10 @@ async def init_db():
 # --- GOOGLE SHEETS GA YOZISH FUNKSIYASI ---
 def save_result_to_sheet(student_id, full_name, school, grade, test_title, subject, score, percentage, correct, wrong):
     try:
-        scope = ["https://www.googleapis.com/auth/spreadsheets"]
+        scope = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive"
+        ]
         if GOOGLE_CREDS_JSON:
             creds_dict = json.loads(GOOGLE_CREDS_JSON)
             creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
