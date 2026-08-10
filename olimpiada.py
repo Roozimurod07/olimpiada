@@ -30,7 +30,7 @@ from google.oauth2.service_account import Credentials
 # --- RAILWAY VA GOOGLE SHEETS SOZLAMALARI ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON")
-SHEET_NAME = "Olimpiada"
+SHEET_NAME = "test"
 
 SUPER_ADMIN_IDS = [8317043750]
 
