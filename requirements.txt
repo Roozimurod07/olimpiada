@@ -1,0 +1,10 @@
+aiogram==3.13.1
+gspread==6.1.2
+google-auth==2.29.0
+sqlalchemy==2.0.32
+aiosqlite==0.20.0
+pypdf==4.3.1
+python-docx==1.1.2
+pandas==2.2.2
+openpyxl==3.1.5
+aiohttp==3.10.5
