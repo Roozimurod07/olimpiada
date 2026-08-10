@@ -136,12 +136,13 @@ def save_result_to_sheet(student_id, full_name, school, grade, test_title, subje
             creds = Credentials.from_service_account_file('credentials.json', scopes=scope)
             
         client = gspread.authorize(creds)
-        sheet = client.open(SHEET_NAME).sheet1
+        spreadsheet = client.open(SHEET_NAME)
+        sheet = spreadsheet.sheet1
         
         # Jadvalga qator qo'shish
-        sheet.append_row([
+        row_data = [
             str(student_id),
-            full_name,
+            str(full_name),
             str(school),
             str(grade),
             str(subject),
@@ -151,9 +152,11 @@ def save_result_to_sheet(student_id, full_name, school, grade, test_title, subje
             str(correct),
             str(wrong),
             datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        ])
+        ]
+        sheet.append_row(row_data)
+        print("✅ Google Sheets'ga natija muvaffaqiyatli yozildi!")
     except Exception as e:
-        logging.error(f"Google Sheets xatosi: {e}")
+        print(f"❌ Google Sheets xatosi: {e}")
 
 class RegState(StatesGroup):
     waiting_for_id = State()
