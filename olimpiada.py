@@ -695,12 +695,7 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
         await session.commit()
         await session.refresh(test_session)
 
-        # Test boshlanganligi haqida faqat qisqa xabar.
-        # Umumiy "60 daqiqa" ko'rsatilmaydi — timer har bir savolda alohida ko'rsatiladi.
-        await callback.message.edit_text(
-            f"🚀 <b>{test.subject} ({test.title})</b> testi boshlandi!\n"
-            f"⏱ Har bir savolga: {test.question_time_seconds} soniya."
-        )
+        await callback.message.edit_text(f"🚀 <b>{test.subject} ({test.title})</b> testi boshlandi!")
         user_id = callback.from_user.id
         await state.set_state(TestProcessState.in_test)
         
@@ -730,23 +725,33 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
                     row = []
             if row: keyboard_buttons.append(row)
             
-            # O'quvchi faqat javob variantini tanlaydi.
-            # Javob tanlanganda save_answer handler keyingi savolga o'tishni ishga tushiradi.
+            # Faqat javob variantlari ko'rsatiladi.
+            # Oldingi / Keyingi / Testni yakunlash tugmalari olib tashlandi.
             markup = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
             
-            q_start_time = datetime.now(timezone.utc)
+            sec_title = f"<b>Fan / Bo'lim: {q.section_name}</b>\n" if q.section_name else ""
+            text_content = f"{sec_title}<b>Savol {index + 1} / {len(questions)}</b> (Ball: {q.points})\n\n{q.question_text}"
+            
+            # Avval savol chiqadi.
+            if q.photo_file_id:
+                q_msg = await bot.send_photo(chat_id=user_id, photo=q.photo_file_id, caption=text_content, reply_markup=markup)
+            else:
+                q_msg = await bot.send_message(chat_id=user_id, text=text_content, reply_markup=markup)
 
-            # Alohida timer xabari: har soniyada 15 -> 14 -> 13 ... ko'rinadi.
-            initial_seconds = max(1, int(test.question_time_seconds))
+            # Har bir savol uchun alohida real-time countdown.
+            q_start_time = datetime.now(timezone.utc)
+            question_seconds = max(1, int(test.question_time_seconds))
             timer_msg = await bot.send_message(
                 chat_id=user_id,
-                text=f"⏳ <b>Qolgan vaqt: {initial_seconds} soniya</b>"
+                text=f"⏳ <b>Qolgan vaqt: {question_seconds} soniya</b>"
             )
-            last_shown_second = initial_seconds
+            last_second = question_seconds
+
+            # Eski flag yangi savolga ta'sir qilmasin.
+            user_next_question_flags.pop(user_id, None)
 
             while True:
                 await asyncio.sleep(0.2)
-
                 now = datetime.now(timezone.utc)
                 total_elapsed = (now - start_timestamp).total_seconds()
                 q_elapsed = (now - q_start_time).total_seconds()
@@ -754,17 +759,14 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
                 if total_elapsed >= total_duration_sec:
                     break
 
-                # O'quvchi javob tanlagan bo'lsa, vaqt tugashini kutmaydi.
+                # Javob tanlangan bo'lsa, darhol keyingi savolga o'tamiz.
                 if user_id in user_next_question_flags:
-                    flag = user_next_question_flags.pop(user_id)
-                    if flag.get("target_index") is None or flag.get("target_index") != index:
-                        break
+                    user_next_question_flags.pop(user_id, None)
+                    break
 
-                remaining = test.question_time_seconds - q_elapsed
-                seconds_left = max(0, int(remaining + 0.999))
-
-                if seconds_left != last_shown_second:
-                    last_shown_second = seconds_left
+                seconds_left = max(0, int(question_seconds - q_elapsed + 0.999))
+                if seconds_left != last_second:
+                    last_second = seconds_left
                     if seconds_left <= 0:
                         break
                     try:
@@ -776,13 +778,17 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
                     except Exception:
                         pass
 
+                if q_elapsed >= question_seconds:
+                    break
+
             try:
                 await bot.delete_message(chat_id=user_id, message_id=timer_msg.message_id)
             except Exception:
                 pass
-
-            try: await bot.delete_message(chat_id=user_id, message_id=q_msg.message_id)
-            except Exception: pass
+            try:
+                await bot.delete_message(chat_id=user_id, message_id=q_msg.message_id)
+            except Exception:
+                pass
             
             if (datetime.now(timezone.utc) - start_timestamp).total_seconds() >= total_duration_sec:
                 break
@@ -815,7 +821,8 @@ async def save_answer(callback: CallbackQuery, bot: Bot):
         if existing: existing.selected_option = selected
         else: session.add(Answer(session_id=session_id, question_id=question_id, selected_option=selected))
         await session.commit()
-    # Javob saqlandi — keyingi savolga darhol o'tish
+
+    # Javob tanlandi — begin_test_session kutmasdan keyingi savolga o'tadi.
     user_next_question_flags[callback.from_user.id] = {"target_index": None}
     await callback.answer(f"Tanlandi: {selected}")
 
