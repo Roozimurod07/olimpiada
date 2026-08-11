@@ -5,7 +5,7 @@ import random
 import os
 import re
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -108,7 +108,7 @@ class TestSession(Base):
     student_id = Column(Integer, ForeignKey("students.id", ondelete="CASCADE"), nullable=False)
     test_id = Column(Integer, ForeignKey("tests.id", ondelete="CASCADE"), nullable=False)
     status = Column(String(30), default="IN_PROGRESS")
-    started_at = Column(DateTime, default=datetime.utcnow)
+    started_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     finished_at = Column(DateTime, nullable=True)
     score = Column(Float, default=0.0)
     score_percentage = Column(Float, default=0.0)
@@ -165,7 +165,6 @@ async def init_db():
         await conn.execute(sa_text("PRAGMA foreign_keys = ON;"))
         await conn.run_sync(Base.metadata.create_all)
         
-        # Avtomatik ravishda tests jadvaliga question_time_seconds ustuni borligini tekshirish va qo'shish
         try:
             await conn.execute(sa_text("SELECT question_time_seconds FROM tests LIMIT 1"))
         except Exception:
@@ -218,7 +217,7 @@ def save_result_to_sheet(student_id, full_name, age, school, grade, test_title, 
         row_data = [
             str(student_id), str(full_name), str(age), str(school), str(grade),
             str(subject), str(test_title), str(score), f"{percentage}%",
-            str(correct), str(wrong), datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            str(correct), str(wrong), datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         ]
         sheet.append_row(row_data)
     except Exception as e:
@@ -268,7 +267,7 @@ def generate_certificate_pdf(student_name, test_title, subject, score_pct):
     c.drawCentredString(width / 2, height - 275, f"olimpiadasida muvaffaqiyatli qatnashib, {score_pct}% natija ko'rsatgani uchun taqdirlanadi.")
     
     c.setFont("Helvetica-Oblique", 12)
-    c.drawString(60, 80, f"Sana: {datetime.now().strftime('%Y-%m-%d')}")
+    c.drawString(60, 80, f"Sana: {datetime.now(timezone.utc).strftime('%Y-%m-%d')}")
     c.drawRightString(width - 60, 80, "Tizim rahbarligi: Professional Olimpiada")
     
     c.save()
@@ -662,13 +661,17 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
             await callback.answer("Bu test topilmadi yoki yopilgan!", show_alert=True)
             return
 
-        now = datetime.utcnow()
-        if test.start_time and now < test.start_time:
-            await callback.answer(f"⏳ Test hali boshlanmagan! Boshlanish vaqti: {test.start_time.strftime('%Y-%m-%d %H:%M')}", show_alert=True)
-            return
-        if test.end_time and now > test.end_time:
-            await callback.answer("⏰ Bu testning vaqti tugagan!", show_alert=True)
-            return
+        now = datetime.now(timezone.utc)
+        if test.start_time:
+            start_t = test.start_time.replace(tzinfo=timezone.utc) if test.start_time.tzinfo is None else test.start_time
+            if now < start_t:
+                await callback.answer(f"⏳ Test hali boshlanmagan! Boshlanish vaqti: {start_t.strftime('%Y-%m-%d %H:%M')}", show_alert=True)
+                return
+        if test.end_time:
+            end_t = test.end_time.replace(tzinfo=timezone.utc) if test.end_time.tzinfo is None else test.end_time
+            if now > end_t:
+                await callback.answer("⏰ Bu testning vaqti tugagan!", show_alert=True)
+                return
 
         if test.max_attempts > 0:
             attempts_count = await session.scalar(
@@ -697,14 +700,14 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
         await state.set_state(TestProcessState.in_test)
         
         total_duration_sec = test.duration_minutes * 60
-        start_timestamp = datetime.utcnow()
+        start_timestamp = datetime.now(timezone.utc)
         
         for index, q in enumerate(questions):
             current_test_check = await session.get(Test, test_id)
             if not current_test_check.is_active or current_test_check.is_finished:
                 break
 
-            elapsed = (datetime.utcnow() - start_timestamp).total_seconds()
+            elapsed = (datetime.now(timezone.utc) - start_timestamp).total_seconds()
             if elapsed >= total_duration_sec:
                 await bot.send_message(chat_id=user_id, text="⏰ Test uchun ajratilgan umumiy vaqt tugadi!")
                 break
@@ -741,13 +744,13 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
             else:
                 q_msg = await bot.send_message(chat_id=user_id, text=text_content, reply_markup=markup)
             
-            q_start_time = datetime.utcnow()
+            q_start_time = datetime.now(timezone.utc)
             while True:
                 await asyncio.sleep(1)
-                now_el = (datetime.utcnow() - start_timestamp).total_seconds()
+                now_el = (datetime.now(timezone.utc) - start_timestamp).total_seconds()
                 if now_el >= total_duration_sec:
                     break
-                q_elapsed = (datetime.utcnow() - q_start_time).total_seconds()
+                q_elapsed = (datetime.now(timezone.utc) - q_start_time).total_seconds()
                 if q_elapsed >= test.question_time_seconds:
                     break
                 if user_id not in user_next_question_flags or user_next_question_flags[user_id].get("target_index") != index:
@@ -756,14 +759,14 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
             try: await bot.delete_message(chat_id=user_id, message_id=q_msg.message_id)
             except Exception: pass
             
-            if (datetime.utcnow() - start_timestamp).total_seconds() >= total_duration_sec:
+            if (datetime.now(timezone.utc) - start_timestamp).total_seconds() >= total_duration_sec:
                 break
 
         async with async_session() as final_session:
             sess = await final_session.get(TestSession, test_session.id)
             if sess and sess.status == "IN_PROGRESS":
                 sess.status = "COMPLETED"
-                sess.finished_at = datetime.utcnow()
+                sess.finished_at = datetime.now(timezone.utc)
                 await calculate_and_save_results(final_session, sess)
                 await final_session.commit()
                 
@@ -1028,12 +1031,9 @@ async def admin_get_start_time(message: Message, state: FSMContext):
     start_dt = None
     if txt != "-":
         try:
-            start_dt = datetime.strptime(txt, "%Y-0%m-%d %H:%M" if len(txt)==16 else "%Y-%m-%d %H:%M")
+            start_dt = datetime.strptime(txt, "%Y-%m-%d %H:%M")
         except:
-            try:
-                start_dt = datetime.strptime(txt, "%Y-%m-%d %H:%M")
-            except:
-                pass
+            pass
     await state.update_data(start_time=start_dt, questions=[])
     await state.set_state(AdminAddTest.waiting_for_questions)
     
@@ -1077,7 +1077,7 @@ async def admin_handle_document(message: Message, state: FSMContext, bot: Bot):
     try:
         if document.file_name.endswith('.pdf'):
             reader = pypdf.PdfReader(file_path)
-            for page in reader.pages: extracted_text += page.extract_text() + "\n"
+            for page in reader.pages: extracted_text += (page.extract_text() or "") + "\n"
         elif document.file_name.endswith('.docx'):
             doc = docx.Document(file_path)
             for para in doc.paragraphs: extracted_text += para.text + "\n"
@@ -1187,7 +1187,7 @@ async def admin_save_answers_and_test(message: Message, state: FSMContext):
             is_block_test=is_block,
             block_subjects=json.dumps({"sub1": data.get("block_sub1"), "sub2": data.get("block_sub2")}) if is_block else None,
             start_time=data.get("start_time"),
-            end_time=data.get("start_time") + timedelta(hours=5) if data.get("start_time") else None,
+            end_time=(data.get("start_time") + timedelta(hours=5)) if data.get("start_time") else None,
             is_active=True, 
             is_finished=False
         )
@@ -1525,25 +1525,28 @@ async def reminder_scheduler(bot: Bot):
     while True:
         await asyncio.sleep(60)
         try:
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
             reminder_target_time = now + timedelta(minutes=15)
             async with async_session() as session:
                 reminders = (await session.execute(
                     select(Reminder, Test, Student)
                     .join(Test, Reminder.test_id == Test.id)
                     .join(Student, Reminder.student_id == Student.id)
-                    .where(Reminder.reminded == False, Test.start_time <= reminder_target_time, Test.start_time > now)
+                    .where(Reminder.reminded == False)
                 )).all()
                 
                 for rem, t, st in reminders:
-                    if st.telegram_id:
-                        try:
-                            await bot.send_message(
-                                chat_id=st.telegram_id,
-                                text=f"🔔 <b>Eslatma!</b>\n\nSiz ro'yxatdan o'tgan <b>{t.subject} ({t.title})</b> testi 15 daqiqadan so'ng boshlanadi."
-                            )
-                        except: pass
-                    rem.reminded = True
+                    if t.start_time:
+                        start_t = t.start_time.replace(tzinfo=timezone.utc) if t.start_time.tzinfo is None else t.start_time
+                        if now < start_t <= reminder_target_time:
+                            if st.telegram_id:
+                                try:
+                                    await bot.send_message(
+                                        chat_id=st.telegram_id,
+                                        text=f"🔔 <b>Eslatma!</b>\n\nSiz ro'yxatdan o'tgan <b>{t.subject} ({t.title})</b> testi 15 daqiqadan so'ng boshlanadi."
+                                    )
+                                except: pass
+                            rem.reminded = True
                 await session.commit()
         except Exception as e:
             logging.error(f"Reminder error: {e}")
