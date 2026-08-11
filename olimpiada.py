@@ -150,7 +150,9 @@ class Appeal(Base):
     
     student = relationship("Student", back_populates="appeals")
 
-engine = create_async_engine("sqlite+aiosqlite:///professional_olimpiada.db", echo=False)
+DB_DIR = os.getenv("DB_DIR", ".")
+DB_PATH = os.path.join(DB_DIR, "professional_olimpiada.db")
+engine = create_async_engine(f"sqlite+aiosqlite:///{DB_PATH}", echo=False)
 
 @event.listens_for(engine.sync_engine, "connect")
 def set_sqlite_pragma(dbapi_connection, connection_record):
@@ -1026,7 +1028,7 @@ async def admin_get_start_time(message: Message, state: FSMContext):
             "Matn yoki Word/PDF fayl ko'rinishida yuborishingiz mumkin.", reply_markup=get_finish_test_keyboard()
         )
     else:
-        await message.answer("📂 Savollarni matn yoki Word/PDF fayl ko'rinishida yuboring (rasmli savollarni rasm va tagiga matn qilib yuborishingiz mumkin).", reply_markup=get_finish_test_keyboard())
+        await message.answer("📂 Savollarni matn yoki Word/PDF fayl ko'rinishida yuboring (rasmli savolarni rasm va tagiga matn qilib yuborishingiz mumkin).", reply_markup=get_finish_test_keyboard())
 
 @router.message(AdminAddTest.waiting_for_questions, F.photo)
 async def admin_handle_photo_question(message: Message, state: FSMContext):
