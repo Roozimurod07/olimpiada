@@ -36,7 +36,7 @@ from google.oauth2.service_account import Credentials
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON")
 SHEET_NAME = "Olimpiada"
-REQUIRED_CHANNEL = "@yetakchi_kabeniti"
+REQUIRED_CHANNEL = "@olimpiada01111"
 
 SUPER_ADMIN_IDS = [8317043750]
 
@@ -197,7 +197,6 @@ def update_result_in_sheet(student_id, test_title, score, percentage, correct):
         records = sheet.get_all_records()
         for idx, row in enumerate(records, start=2):
             if str(row.get("ID")) == str(student_id) and str(row.get("Test")) == str(test_title):
-                # Ustunlar tartibi: 8-Ball, 9-Foiz, 10-To'g'ri javoblar
                 sheet.update_cell(idx, 8, str(score))
                 sheet.update_cell(idx, 9, f"{percentage}%")
                 sheet.update_cell(idx, 10, str(correct))
@@ -336,7 +335,6 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot):
             await message.answer(f"Xush kelibsiz, <b>{student.first_name} {student.last_name}</b>!\nSinfingiz: <b>{student.grade or 'Nomaʼlum'}</b>", reply_markup=get_main_menu())
             return
 
-    # O'quvchi bazada bo'lmasa, o'zi ro'yxatdan o'tishni boshlaydi
     await state.set_state(SelfRegState.waiting_for_fullname)
     await message.answer("🎓 <b>Olimpiada tizimiga xush kelibsiz!</b>\n\nIltimos, to'liq <b>Ism va Familiyangizni</b> kiriting:")
 
@@ -359,7 +357,6 @@ async def check_sub_callback(callback: CallbackQuery, state: FSMContext, bot: Bo
     await state.set_state(SelfRegState.waiting_for_fullname)
     await callback.message.answer("🎓 Muvaffaqiyatli obuna bo'ldingiz!\n\nIltimos, to'liq <b>Ism va Familiyangizni</b> kiriting:")
 
-# --- O'QUVCHILARNING O'ZI RO'YXATDAN O'TISH JARAYONI ---
 @router.message(SelfRegState.waiting_for_fullname)
 async def process_self_fullname(message: Message, state: FSMContext):
     await state.update_data(fullname=message.text.strip())
@@ -441,7 +438,6 @@ async def my_attempts_handler(message: Message, state: FSMContext):
             
         await message.answer(text)
 
-# --- O'QUVCHILAR UCHUN ALOHIDA APELLYATSIYA BO'LIMI ---
 @router.message(F.text == "⚖️ Apellyatsiya")
 async def student_appeal_menu(message: Message, state: FSMContext):
     if await state.get_state() == TestProcessState.in_test.state: return
@@ -459,7 +455,7 @@ async def student_appeal_menu(message: Message, state: FSMContext):
         )).all()
         
         if not sessions:
-            await message.answer("⚠️ Hozirda apellyatsiya berish uchun yakunlangan va natijalari e'lon qilingan testlar mavjud emas.\n(Admin testni to'xtatib, yakunlamaguncha savollar va apellyatsiya yopiq bo'ladi).")
+            await message.answer("⚠️ Hozirda apellyatsiya berish uchun yakunlangan va natijalari e'lon qilingan testlar mavjud emas.")
             return
             
         keyboard_buttons = []
@@ -1061,7 +1057,6 @@ async def accept_appeal(callback: CallbackQuery, bot: Bot):
         student = await session.get(Student, appeal.student_id)
         test = await session.get(Test, ts.test_id)
         
-        # Google Sheets jadvalidagi natijani yangilash
         update_result_in_sheet(student.student_id, test.title, ts.score, ts.score_percentage, ts.correct_answers)
         
         if student and student.telegram_id:
