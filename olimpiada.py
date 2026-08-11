@@ -725,15 +725,8 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
                     row = []
             if row: keyboard_buttons.append(row)
             
-            nav_row = []
-            if index > 0:
-                nav_row.append(InlineKeyboardButton(text="⬅️ Oldingi", callback_data=f"navigate_{test_session.id}_{index - 1}"))
-            if index < len(questions) - 1:
-                nav_row.append(InlineKeyboardButton(text="Keyingi ➡️", callback_data=f"navigate_{test_session.id}_{index + 1}"))
-            if nav_row:
-                keyboard_buttons.append(nav_row)
-            
-            keyboard_buttons.append([InlineKeyboardButton(text="🏁 Testni yakunlash", callback_data=f"finish_early_{test_session.id}")])
+            # O'quvchi faqat javob variantini tanlaydi.
+            # Javob tanlanganda save_answer handler keyingi savolga o'tishni ishga tushiradi.
             markup = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
             
             sec_title = f"<b>Fan / Bo'lim: {q.section_name}</b>\n" if q.section_name else ""
@@ -753,8 +746,12 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
                 q_elapsed = (datetime.now(timezone.utc) - q_start_time).total_seconds()
                 if q_elapsed >= test.question_time_seconds:
                     break
-                if user_id in user_next_question_flags and user_next_question_flags[user_id].get("target_index") != index:
-                    break
+                if user_id in user_next_question_flags:
+                    flag = user_next_question_flags.pop(user_id)
+                    if flag.get("target_index") is None:
+                        break
+                    if flag.get("target_index") != index:
+                        break
             
             try: await bot.delete_message(chat_id=user_id, message_id=q_msg.message_id)
             except Exception: pass
@@ -790,6 +787,8 @@ async def save_answer(callback: CallbackQuery, bot: Bot):
         if existing: existing.selected_option = selected
         else: session.add(Answer(session_id=session_id, question_id=question_id, selected_option=selected))
         await session.commit()
+    # Javob saqlandi — keyingi savolga darhol o'tish
+    user_next_question_flags[callback.from_user.id] = {"target_index": None}
     await callback.answer(f"Tanlandi: {selected}")
 
 @router.callback_query(F.data.startswith("navigate_"))
