@@ -753,7 +753,7 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
                 q_elapsed = (datetime.now(timezone.utc) - q_start_time).total_seconds()
                 if q_elapsed >= test.question_time_seconds:
                     break
-                if user_id not in user_next_question_flags or user_next_question_flags[user_id].get("target_index") != index:
+                if user_id in user_next_question_flags and user_next_question_flags[user_id].get("target_index") != index:
                     break
             
             try: await bot.delete_message(chat_id=user_id, message_id=q_msg.message_id)
