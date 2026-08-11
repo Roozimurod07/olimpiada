@@ -1,4 +1,4 @@
-[cite: 2]import asyncio
+import asyncio
 import logging
 import sys
 import random
