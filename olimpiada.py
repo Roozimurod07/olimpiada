@@ -23,16 +23,13 @@ import docx
 import pandas as pd
 import io
 
-# PDF Sertifikat uchun kutubxona
 from reportlab.lib.pagesizes import landscape, letter
 from reportlab.pdfgen import canvas
 from reportlab.lib import colors
 
-# Google Sheets kutubxonalari
 import gspread
 from google.oauth2.service_account import Credentials
 
-# --- RAILWAY VA GOOGLE SHEETS SOZLAMALARI ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON")
 SHEET_NAME = "Olimpiada"
@@ -76,10 +73,10 @@ class Test(Base):
     grade_level = Column(String(20), nullable=False)
     max_attempts = Column(Integer, default=1)
     mode = Column(String(20), default="global_timer")
-    duration_minutes = Column(Integer, default=180) # 3 soat
-    question_time_seconds = Column(Integer, default=60) # Har bir savol uchun soniya (admin kiritadi)
+    duration_minutes = Column(Integer, default=180)
+    question_time_seconds = Column(Integer, default=60)
     is_block_test = Column(Boolean, default=False)
-    block_subjects = Column(Text, nullable=True) # JSON formatida asosiy fanlar
+    block_subjects = Column(Text, nullable=True)
     start_time = Column(DateTime, nullable=True)
     end_time = Column(DateTime, nullable=True)
     is_active = Column(Boolean, default=True)
@@ -92,7 +89,7 @@ class Question(Base):
     __tablename__ = "questions"
     id = Column(Integer, primary_key=True, autoincrement=True)
     test_id = Column(Integer, ForeignKey("tests.id", ondelete="CASCADE"), nullable=False)
-    section_name = Column(String(100), nullable=True) # Fan nomi
+    section_name = Column(String(100), nullable=True)
     question_text = Column(Text, nullable=False)
     photo_file_id = Column(String(200), nullable=True)
     option_a = Column(Text, nullable=False)
@@ -268,7 +265,6 @@ def generate_certificate_pdf(student_name, test_title, subject, score_pct):
     pdf_buffer.seek(0)
     return pdf_buffer.read()
 
-# --- STATES ---
 class SelfRegState(StatesGroup):
     waiting_for_fullname = State()
     waiting_for_age = State()
@@ -286,7 +282,7 @@ class AdminAddTest(StatesGroup):
     waiting_for_is_block = State()
     waiting_for_block_sub1 = State()
     waiting_for_block_sub2 = State()
-    waiting_for_question_time = State() # Har bir test uchun soniya
+    waiting_for_question_time = State()
     waiting_for_attempts = State()
     waiting_for_start_time = State()
     waiting_for_questions = State()
@@ -735,7 +731,6 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
             else:
                 q_msg = await bot.send_message(chat_id=user_id, text=text_content, reply_markup=markup)
             
-            # Har bir savol uchun admin belgilagan soniya (yoki umumiy vaqt tugaguncha) kutish
             q_start_time = datetime.utcnow()
             while True:
                 await asyncio.sleep(1)
@@ -947,14 +942,13 @@ async def admin_process_excel_students(message: Message, state: FSMContext, bot:
 @router.message(F.text == "📂 Test yuklash")
 async def admin_add_test_start(message: Message, state: FSMContext):
     if not await is_admin(message.from_user.id): return
-    await state.update_data(is_block=False, duration_minutes=60) # Oddiy test uchun boshlang'ich umumiy vaqt
+    await state.update_data(is_block=False, duration_minutes=60)
     await state.set_state(AdminAddTest.waiting_for_title)
     await message.answer("📂 Test sarlavhasini kiriting:")
 
 @router.message(F.text == "🧩 Blok test yuklash")
 async def admin_add_block_test_start(message: Message, state: FSMContext):
     if not await is_admin(message.from_user.id): return
-    # Blok test uchun talab qilinganidek duration = 180 daqiqa qilib belgilanadi
     await state.update_data(is_block=True, duration_minutes=180)
     await state.set_state(AdminAddTest.waiting_for_title)
     await message.answer("🧩 DTM Blok test sarlavhasini kiriting:")
@@ -1250,6 +1244,10 @@ async def manage_tests_admin(message: Message):
             ])
         await message.answer("⚙️ Testlarni boshqarish:", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
 
+@router.callback_query(F.data == "none")
+async def ignore_callback(callback: CallbackQuery):
+    await callback.answer()
+
 @router.callback_query(F.data.startswith("toggle_test_"))
 async def toggle_test(callback: CallbackQuery):
     async with async_session() as session:
@@ -1258,6 +1256,20 @@ async def toggle_test(callback: CallbackQuery):
             test.is_active = not test.is_active
             await session.commit()
             await callback.answer(f"Test holati o'zgardi! Aktiv: {test.is_active}")
+            try:
+                tests = (await session.execute(select(Test))).scalars().all()
+                keyboard = []
+                for t in tests:
+                    status_emoji = '🟢 Aktiv' if t.is_active and not t.is_finished else ('🏁 Yakunlangan' if t.is_finished else '🔴 To\'xtatilgan')
+                    keyboard.append([InlineKeyboardButton(text=f"[{t.grade_level}] {t.subject} ({status_emoji})", callback_data="none")])
+                    keyboard.append([
+                        InlineKeyboardButton(text="🔄 Holatni o'zgartirish", callback_data=f"toggle_test_{t.id}"),
+                        InlineKeyboardButton(text="🏁 Testni yakunlash", callback_data=f"finish_test_{t.id}"),
+                        InlineKeyboardButton(text="🗑 O'chirish", callback_data=f"delete_test_{t.id}")
+                    ])
+                await callback.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+            except Exception:
+                pass
 
 @router.callback_query(F.data.startswith("finish_test_"))
 async def finish_test_by_admin(callback: CallbackQuery):
@@ -1268,6 +1280,20 @@ async def finish_test_by_admin(callback: CallbackQuery):
             test.is_finished = True
             await session.commit()
             await callback.answer("Test to'liq yakunlandi!", show_alert=True)
+            try:
+                tests = (await session.execute(select(Test))).scalars().all()
+                keyboard = []
+                for t in tests:
+                    status_emoji = '🟢 Aktiv' if t.is_active and not t.is_finished else ('🏁 Yakunlangan' if t.is_finished else '🔴 To\'xtatilgan')
+                    keyboard.append([InlineKeyboardButton(text=f"[{t.grade_level}] {t.subject} ({status_emoji})", callback_data="none")])
+                    keyboard.append([
+                        InlineKeyboardButton(text="🔄 Holatni o'zgartirish", callback_data=f"toggle_test_{t.id}"),
+                        InlineKeyboardButton(text="🏁 Testni yakunlash", callback_data=f"finish_test_{t.id}"),
+                        InlineKeyboardButton(text="🗑 O'chirish", callback_data=f"delete_test_{t.id}")
+                    ])
+                await callback.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+            except Exception:
+                pass
 
 @router.callback_query(F.data.startswith("delete_test_"))
 async def delete_test(callback: CallbackQuery):
@@ -1277,6 +1303,23 @@ async def delete_test(callback: CallbackQuery):
             await session.delete(test)
             await session.commit()
             await callback.answer("Test o'chirildi!")
+            try:
+                tests = (await session.execute(select(Test))).scalars().all()
+                if not tests:
+                    await callback.message.edit_text("Testlar yo'q.")
+                    return
+                keyboard = []
+                for t in tests:
+                    status_emoji = '🟢 Aktiv' if t.is_active and not t.is_finished else ('🏁 Yakunlangan' if t.is_finished else '🔴 To\'xtatilgan')
+                    keyboard.append([InlineKeyboardButton(text=f"[{t.grade_level}] {t.subject} ({status_emoji})", callback_data="none")])
+                    keyboard.append([
+                        InlineKeyboardButton(text="🔄 Holatni o'zgartirish", callback_data=f"toggle_test_{t.id}"),
+                        InlineKeyboardButton(text="🏁 Testni yakunlash", callback_data=f"finish_test_{t.id}"),
+                        InlineKeyboardButton(text="🗑 O'chirish", callback_data=f"delete_test_{t.id}")
+                    ])
+                await callback.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+            except Exception:
+                pass
 
 @router.message(F.text == "⚖️ Apellyatsiyalar")
 async def admin_appeals_handler(message: Message):
@@ -1410,7 +1453,8 @@ async def live_statistics(message: Message):
 async def export_excel_results(message: Message, bot: Bot):
     if not await is_admin(message.from_user.id): return
     async with async_session() as session:
-        rows = (await session.execute(select(Student, TestSession, Test).join(TestSession, Student.id == TestSession.student_id).join(Test, TestSession.test_id == Test.id))).all()
+        result_query = await session.execute(select(Student, TestSession, Test).join(TestSession, Student.id == TestSession.student_id).join(Test, TestSession.test_id == Test.id))
+        rows = result_query.all()
         if not rows:
             await message.answer("Natijalar yo'q.")
             return
