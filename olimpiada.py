@@ -110,7 +110,7 @@ class TestSession(Base):
     student_id = Column(Integer, ForeignKey("students.id", ondelete="CASCADE"), nullable=False)
     test_id = Column(Integer, ForeignKey("tests.id", ondelete="CASCADE"), nullable=False)
     status = Column(String(30), default="IN_PROGRESS")
-    started_at = Column(DateTime, default=datetime.utcnow)
+    started_at = Column(DateTime, default=datetime.now)
     finished_at = Column(DateTime, nullable=True)
     score = Column(Float, default=0.0)
     score_percentage = Column(Float, default=0.0)
@@ -659,7 +659,7 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
             await callback.answer("Bu test topilmadi yoki yopilgan!", show_alert=True)
             return
 
-        now = datetime.utcnow()
+        now = datetime.now()
         if test.start_time and now < test.start_time:
             await callback.answer(f"⏳ Test hali boshlanmagan! Boshlanish vaqti: {test.start_time.strftime('%Y-%m-%d %H:%M')}", show_alert=True)
             return
@@ -694,7 +694,7 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
         await state.set_state(TestProcessState.in_test)
         
         total_duration_sec = test.duration_minutes * 60
-        start_timestamp = datetime.utcnow()
+        start_timestamp = datetime.now()
         
         for index, q in enumerate(questions):
             current_test_check = await session.get(Test, test_id)
@@ -702,7 +702,7 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
                 break
 
             # Vaqt tugaganini tekshirish
-            elapsed = (datetime.utcnow() - start_timestamp).total_seconds()
+            elapsed = (datetime.now() - start_timestamp).total_seconds()
             if elapsed >= total_duration_sec:
                 await bot.send_message(chat_id=user_id, text="⏰ Test uchun ajratilgan umumiy vaqt tugadi!")
                 break
@@ -741,7 +741,7 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
             
             while True:
                 await asyncio.sleep(1)
-                now_el = (datetime.utcnow() - start_timestamp).total_seconds()
+                now_el = (datetime.now() - start_timestamp).total_seconds()
                 if now_el >= total_duration_sec:
                     break
                 if user_id not in user_next_question_flags or user_next_question_flags[user_id].get("target_index") != index:
@@ -750,14 +750,14 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
             try: await bot.delete_message(chat_id=user_id, message_id=q_msg.message_id)
             except Exception: pass
             
-            if (datetime.utcnow() - start_timestamp).total_seconds() >= total_duration_sec:
+            if (datetime.now() - start_timestamp).total_seconds() >= total_duration_sec:
                 break
 
         async with async_session() as final_session:
             sess = await final_session.get(TestSession, test_session.id)
             if sess and sess.status == "IN_PROGRESS":
                 sess.status = "COMPLETED"
-                sess.finished_at = datetime.utcnow()
+                sess.finished_at = datetime.now()
                 await calculate_and_save_results(final_session, sess)
                 await final_session.commit()
                 
@@ -1457,7 +1457,7 @@ async def reminder_scheduler(bot: Bot):
     while True:
         await asyncio.sleep(60)
         try:
-            now = datetime.utcnow()
+            now = datetime.now()
             reminder_target_time = now + timedelta(minutes=15)
             async with async_session() as session:
                 reminders = (await session.execute(
