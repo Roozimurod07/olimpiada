@@ -59,7 +59,7 @@ class Admin(Base):
     __tablename__ = "admins"
     id = Column(Integer, primary_key=True, autoincrement=True)
     telegram_id = Column(Integer, unique=True, nullable=False)
-    role = Column(String(50), default="moderator") # super, moderator
+    role = Column(String(50), default="moderator")
 
 class Test(Base):
     __tablename__ = "tests"
@@ -68,9 +68,9 @@ class Test(Base):
     subject = Column(String(100), nullable=False)
     grade_level = Column(String(20), nullable=False)
     max_attempts = Column(Integer, default=1)
-    mode = Column(String(20), default="question_timer") # "exam" (umumiy vaqt) yoki "question_timer" (har savolga)
-    duration_minutes = Column(Integer, default=30) # Imtihon rejimi uchun umumiy vaqt (minut)
-    duration_seconds_per_question = Column(Integer, default=15) # Har bir savol vaqti
+    mode = Column(String(20), default="question_timer")
+    duration_minutes = Column(Integer, default=30)
+    duration_seconds_per_question = Column(Integer, default=15)
     start_time = Column(DateTime, nullable=True)
     end_time = Column(DateTime, nullable=True)
     is_active = Column(Boolean, default=True)
@@ -83,7 +83,7 @@ class Question(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     test_id = Column(Integer, ForeignKey("tests.id", ondelete="CASCADE"), nullable=False)
     question_text = Column(Text, nullable=False)
-    photo_file_id = Column(String(200), nullable=True) # Rasm yoki schema uchun
+    photo_file_id = Column(String(200), nullable=True)
     option_a = Column(Text, nullable=False)
     option_b = Column(Text, nullable=False)
     option_c = Column(Text, nullable=True)
@@ -129,7 +129,7 @@ class Appeal(Base):
     test_session_id = Column(Integer, ForeignKey("test_sessions.id", ondelete="CASCADE"), nullable=False)
     question_id = Column(Integer, ForeignKey("questions.id", ondelete="CASCADE"), nullable=False)
     message_text = Column(Text, nullable=False)
-    status = Column(String(30), default="PENDING") # PENDING, APPROVED, REJECTED
+    status = Column(String(30), default="PENDING")
     
     student = relationship("Student", back_populates="appeals")
 
@@ -155,20 +155,20 @@ async def is_admin(user_id: int) -> bool:
         adm = (await session.execute(select(Admin).where(Admin.telegram_id == user_id))).scalar_one_or_none()
         return adm is not None
 
-# --- GOOGLE SHEETS GA YOZISH FUNKSIYASI ---
+# --- GOOGLE SHEETS BILAN ISHLASH ---
+def get_gspread_sheet():
+    scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+    if GOOGLE_CREDS_JSON:
+        creds_dict = json.loads(GOOGLE_CREDS_JSON)
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
+    else:
+        creds = Credentials.from_service_account_file('credentials.json', scopes=scope)
+    client = gspread.authorize(creds)
+    return client.open(SHEET_NAME).sheet1
+
 def save_result_to_sheet(student_id, full_name, school, grade, test_title, subject, score, percentage, correct, wrong):
     try:
-        scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-        if GOOGLE_CREDS_JSON:
-            creds_dict = json.loads(GOOGLE_CREDS_JSON)
-            creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
-        else:
-            creds = Credentials.from_service_account_file('credentials.json', scopes=scope)
-            
-        client = gspread.authorize(creds)
-        spreadsheet = client.open(SHEET_NAME)
-        sheet = spreadsheet.sheet1
-        
+        sheet = get_gspread_sheet()
         row_data = [
             str(student_id), str(full_name), str(school), str(grade),
             str(subject), str(test_title), str(score), f"{percentage}%",
@@ -176,15 +176,27 @@ def save_result_to_sheet(student_id, full_name, school, grade, test_title, subje
         ]
         sheet.append_row(row_data)
     except Exception as e:
-        print(f"❌ Google Sheets xatosi: {e}")
+        print(f"❌ Google Sheets qo'shish xatosi: {e}")
+
+def update_result_in_sheet(student_id, test_title, score, percentage, correct):
+    try:
+        sheet = get_gspread_sheet()
+        records = sheet.get_all_records()
+        for idx, row in enumerate(records, start=2): # 1-qator sarlavha
+            if str(row.get("ID")) == str(student_id) and str(row.get("Test")) == str(test_title):
+                sheet.update_cell(idx, 7, str(score))          # Ball ustuni
+                sheet.update_cell(idx, 8, f"{percentage}%")    # Foiz ustuni
+                sheet.update_cell(idx, 9, str(correct))        # To'g'ri javoblar ustuni
+                break
+    except Exception as e:
+        print(f"❌ Google Sheets yangilash xatosi: {e}")
 
 # --- SERTIFIKAT GENERATSIYA QILISH ---
 def generate_certificate_pdf(student_name, test_title, subject, score_pct):
     pdf_buffer = io.BytesIO()
     c = canvas.Canvas(pdf_buffer, pagesize=landscape(letter))
-    width, height = 792, 612 # Landscape letter size
+    width, height = 792, 612
     
-    # Orqa fon va ramka
     c.setStrokeColor(colors.HexColor("#1A365D"))
     c.setLineWidth(5)
     c.rect(20, 20, width - 40, height - 40)
@@ -193,7 +205,6 @@ def generate_certificate_pdf(student_name, test_title, subject, score_pct):
     c.setLineWidth(2)
     c.rect(28, 28, width - 56, height - 56)
     
-    # Matnlar
     c.setFillColor(colors.HexColor("#1A365D"))
     c.setFont("Helvetica-Bold", 28)
     c.drawCentredString(width / 2, height - 100, "SERTIFIKAT")
@@ -208,14 +219,8 @@ def generate_certificate_pdf(student_name, test_title, subject, score_pct):
     
     c.setFont("Helvetica", 14)
     c.setFillColor(colors.HexColor("#4A5568"))
-    c.drawCentredString(
-        width / 2, height - 250, 
-        f"<b>{subject}</b> fani bo'yicha o'tkazilgan <b>'{test_title}'</b>"
-    )
-    c.drawCentredString(
-        width / 2, height - 275, 
-        f"olimpiadasida muvaffaqiyatli qatnashib, <b>{score_pct}%</b> natija ko'rsatgani uchun taqdirlanadi."
-    )
+    c.drawCentredString(width / 2, height - 250, f"{subject} fani bo'yicha o'tkazilgan '{test_title}'")
+    c.drawCentredString(width / 2, height - 275, f"olimpiadasida muvaffaqiyatli qatnashib, {score_pct}% natija ko'rsatgani uchun taqdirlanadi.")
     
     c.setFont("Helvetica-Oblique", 12)
     c.drawString(60, 80, f"Sana: {datetime.now().strftime('%Y-%m-%d')}")
@@ -281,9 +286,7 @@ def get_admin_menu():
 
 def get_finish_test_keyboard():
     return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="✅ Javobni yuklash / Testni saqlash")]
-        ],
+        keyboard=[[KeyboardButton(text="✅ Javobni yuklash / Testni saqlash")]],
         resize_keyboard=True
     )
 
@@ -330,9 +333,7 @@ async def process_student_id(message: Message, state: FSMContext):
 
 @router.message(F.text == "👤 Profilim")
 async def profile_handler(message: Message, state: FSMContext):
-    if await state.get_state() == TestProcessState.in_test.state:
-        await message.answer("⚠️ Test jarayonida boshqa menyuga o'tib bo'lmaydi!")
-        return
+    if await state.get_state() == TestProcessState.in_test.state: return
     async with async_session() as session:
         student = (await session.execute(select(Student).where(Student.telegram_id == message.from_user.id))).scalar_one_or_none()
         if not student:
@@ -342,9 +343,7 @@ async def profile_handler(message: Message, state: FSMContext):
 
 @router.message(F.text == "📊 Mening urinishlarim")
 async def my_attempts_handler(message: Message, state: FSMContext):
-    if await state.get_state() == TestProcessState.in_test.state:
-        await message.answer("⚠️ Test jarayonida boshqa menyuga o'tib bo'lmaydi!")
-        return
+    if await state.get_state() == TestProcessState.in_test.state: return
     async with async_session() as session:
         student = (await session.execute(select(Student).where(Student.telegram_id == message.from_user.id))).scalar_one_or_none()
         if not student:
@@ -379,7 +378,6 @@ async def show_attempt_detail(callback: CallbackQuery):
     async with async_session() as session:
         ts = await session.get(TestSession, session_id)
         test = await session.get(Test, ts.test_id)
-        student = await session.get(Student, ts.student_id)
         questions = (await session.execute(select(Question).where(Question.test_id == test.id))).scalars().all()
         answers = {a.question_id: a.selected_option for a in (await session.execute(select(Answer).where(Answer.session_id == ts.id))).scalars().all()}
         
@@ -430,7 +428,7 @@ async def start_appeal(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 @router.message(AppealState.waiting_for_text)
-async def process_appeal_text(message: Message, state: FSMContext, bot: Bot):
+async def process_appeal_text(message: Message, state: FSMContext):
     data = await state.get_data()
     async with async_session() as session:
         student = (await session.execute(select(Student).where(Student.telegram_id == message.from_user.id))).scalar_one_or_none()
@@ -450,9 +448,7 @@ user_next_question_flags = {}
 
 @router.message(F.text == "📝 Testni boshlash")
 async def start_test_prompt(message: Message, state: FSMContext):
-    if await state.get_state() == TestProcessState.in_test.state:
-        await message.answer("⚠️ Siz hozir test ishlayapsiz!")
-        return
+    if await state.get_state() == TestProcessState.in_test.state: return
     async with async_session() as session:
         student = (await session.execute(select(Student).where(Student.telegram_id == message.from_user.id))).scalar_one_or_none()
         if not student or not student.grade:
@@ -467,10 +463,7 @@ async def start_test_prompt(message: Message, state: FSMContext):
             await message.answer(f"⚠️ Hozirda <b>{student.grade}</b> uchun faol testlar mavjud emas.")
             return
 
-        keyboard_buttons = []
-        for t in tests:
-            keyboard_buttons.append([InlineKeyboardButton(text=f"📚 {t.subject} — {t.title}", callback_data=f"start_test_{t.id}")])
-        
+        keyboard_buttons = [[InlineKeyboardButton(text=f"📚 {t.subject} — {t.title}", callback_data=f"start_test_{t.id}")] for t in tests]
         await message.answer("📝 <b>Mavjud testlar:</b>\n\nFanni tanlang:", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_buttons))
 
 @router.callback_query(F.data.startswith("start_test_"))
@@ -487,7 +480,7 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
 
         now = datetime.utcnow()
         if test.start_time and now < test.start_time:
-            await callback.answer(f"⏳ Test hali boshlanmagan! Boshlanish vaqti: {test.start_time}", show_alert=True)
+            await callback.answer(f"⏳ Test hali boshlanmagan!", show_alert=True)
             return
         if test.end_time and now > test.end_time:
             await callback.answer("⏰ Bu testning vaqti tugagan!", show_alert=True)
@@ -502,7 +495,7 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
                 )
             )
             if attempts_count >= test.max_attempts:
-                await callback.answer(f"❌ Ruxsat etilgan urinishlar soni tugagan: {test.max_attempts}", show_alert=True)
+                await callback.answer(f"❌ Urinishlar soni tugagan: {test.max_attempts}", show_alert=True)
                 return
 
         questions = (await session.execute(select(Question).where(Question.test_id == test_id))).scalars().all()
@@ -517,16 +510,14 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
         await session.commit()
         await session.refresh(test_session)
 
-        await callback.message.edit_text(f"🚀 <b>{test.subject}</b> testi boshlandi! Rejim: <code>{test.mode}</code>")
+        await callback.message.edit_text(f"🚀 <b>{test.subject}</b> testi boshlandi!")
         user_id = callback.from_user.id
         await state.set_state(TestProcessState.in_test)
         
-        # Savollarni berish (Variantlarni ham randomizatsiya qilish bilan)
         for index, q in enumerate(questions):
             options = [("A", q.option_a), ("B", q.option_b)]
             if q.option_c: options.append(("C", q.option_c))
             if q.option_d: options.append(("D", q.option_d))
-            
             random.shuffle(options)
             
             keyboard_buttons = []
@@ -536,9 +527,7 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
                 if len(row) == 2:
                     keyboard_buttons.append(row)
                     row = []
-            if row:
-                keyboard_buttons.append(row)
-            
+            if row: keyboard_buttons.append(row)
             keyboard_buttons.append([InlineKeyboardButton(text="➡️ Keyingi savol", callback_data=f"next_q_{test_session.id}")])
             markup = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
             
@@ -553,19 +542,15 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
             
             for _ in range(duration_per_q):
                 await asyncio.sleep(1)
-                if user_next_question_flags.get(user_id, False):
-                    break
+                if user_next_question_flags.get(user_id, False): break
                 remaining_time -= 1
                 try:
                     if not q.photo_file_id:
                         await bot.edit_message_text(chat_id=user_id, message_id=q_msg.message_id, text=f"<b>Savol {index + 1} / {len(questions)}</b> (⏱ {remaining_time}s)\n\n{q.question_text}", reply_markup=markup)
-                except Exception:
-                    pass
+                except Exception: pass
             
-            try:
-                await bot.delete_message(chat_id=user_id, message_id=q_msg.message_id)
-            except Exception:
-                pass
+            try: await bot.delete_message(chat_id=user_id, message_id=q_msg.message_id)
+            except Exception: pass
 
         async with async_session() as final_session:
             sess = await final_session.get(TestSession, test_session.id)
@@ -589,26 +574,20 @@ async def save_answer(callback: CallbackQuery, bot: Bot):
     session_id, question_id, selected = int(parts[1]), int(parts[2]), parts[3]
     async with async_session() as session:
         existing = (await session.execute(select(Answer).where(Answer.session_id == session_id, Answer.question_id == question_id))).scalar_one_or_none()
-        if existing:
-            existing.selected_option = selected
-        else:
-            session.add(Answer(session_id=session_id, question_id=question_id, selected_option=selected))
+        if existing: existing.selected_option = selected
+        else: session.add(Answer(session_id=session_id, question_id=question_id, selected_option=selected))
         await session.commit()
     user_next_question_flags[callback.from_user.id] = True
     await callback.answer(f"Tanlandi: {selected}")
-    try:
-        await bot.delete_message(chat_id=callback.message.chat.id, message_id=callback.message.message_id)
-    except Exception:
-        pass
+    try: await bot.delete_message(chat_id=callback.message.chat.id, message_id=callback.message.message_id)
+    except Exception: pass
 
 @router.callback_query(F.data.startswith("next_q_"))
 async def next_question_callback(callback: CallbackQuery, bot: Bot):
     user_next_question_flags[callback.from_user.id] = True
     await callback.answer("Keyingi savol...")
-    try:
-        await bot.delete_message(chat_id=callback.message.chat.id, message_id=callback.message.message_id)
-    except Exception:
-        pass
+    try: await bot.delete_message(chat_id=callback.message.chat.id, message_id=callback.message.message_id)
+    except Exception: pass
 
 async def calculate_and_save_results(session, sess: TestSession):
     questions = (await session.execute(select(Question).where(Question.test_id == sess.test_id))).scalars().all()
@@ -617,13 +596,11 @@ async def calculate_and_save_results(session, sess: TestSession):
     correct, wrong, unanswered, total_score = 0, 0, 0, 0.0
     for q in questions:
         sel = answers.get(q.id)
-        if not sel:
-            unanswered += 1
+        if not sel: unanswered += 1
         elif sel == q.correct_option:
             correct += 1
             total_score += q.points
-        else:
-            wrong += 1
+        else: wrong += 1
             
     total_q = len(questions)
     sess.correct_answers = correct
@@ -634,8 +611,7 @@ async def calculate_and_save_results(session, sess: TestSession):
 
 @router.message(F.text == "🏆 Reyting")
 async def rating_menu_prompt(message: Message, state: FSMContext):
-    if await state.get_state() == TestProcessState.in_test.state:
-        return
+    if await state.get_state() == TestProcessState.in_test.state: return
     async with async_session() as session:
         tests = (await session.execute(select(Test))).scalars().all()
         if not tests:
@@ -667,14 +643,12 @@ async def show_specific_test_rating(callback: CallbackQuery):
 
 @router.message(F.text == "ℹ️ Olimpiada haqida")
 async def about_handler(message: Message, state: FSMContext):
-    if await state.get_state() == TestProcessState.in_test.state:
-        return
+    if await state.get_state() == TestProcessState.in_test.state: return
     await message.answer("ℹ️ Professional Olimpiada Tizimi v2.0 — Sertifikat va Apellyatsiya funksiyalari bilan.")
 
 @router.message(Command("admin"))
 async def admin_panel(message: Message, state: FSMContext):
-    if not await is_admin(message.from_user.id):
-        return
+    if not await is_admin(message.from_user.id): return
     await state.clear()
     await message.answer("🛠 <b>Admin Panel</b>", reply_markup=get_admin_menu())
 
@@ -756,7 +730,7 @@ async def admin_get_attempts(message: Message, state: FSMContext):
     except: att = 1
     await state.update_data(max_attempts=att, questions=[])
     await state.set_state(AdminAddTest.waiting_for_questions)
-    await message.answer("📂 Savollarni matn yoki Word/PDF fayl ko'rinishida yuboring. Tugatgach, pastdagi tugmani bosing.", reply_markup=get_finish_test_keyboard())
+    await message.answer("📂 Savollarni matn yoki Word/PDF fayl ko'rinishida yuboring.", reply_markup=get_finish_test_keyboard())
 
 @router.message(AdminAddTest.waiting_for_questions, F.document)
 async def admin_handle_document(message: Message, state: FSMContext, bot: Bot):
@@ -829,8 +803,7 @@ async def parse_and_add_questions(text: str, state: FSMContext) -> int:
             })
             added += 1
             i = max(a_idx, b_idx, c_idx, d_idx) + 1
-        else:
-            i += 1
+        else: i += 1
     await state.update_data(questions=questions_list)
     return added
 
@@ -911,38 +884,82 @@ async def view_appeal(callback: CallbackQuery):
     appeal_id = int(callback.data.split("_")[2])
     async with async_session() as session:
         appeal = await session.get(Appeal, appeal_id)
+        if not appeal:
+            await callback.answer("Topilmadi!", show_alert=True)
+            return
         student = await session.get(Student, appeal.student_id)
         question = await session.get(Question, appeal.question_id)
+        test_session = await session.get(TestSession, appeal.test_session_id)
+        test = await session.get(Test, test_session.test_id)
         
         text = f"⚖️ <b>Apellyatsiya #{appeal.id}</b>\n\n" \
-               f"O'quvchi: {student.first_name} {student.last_name} ({student.student_id})\n" \
-               f"Savol: {question.question_text}\n" \
-               f"Xabar: {appeal.message_text}"
+               f"👤 O'quvchi: <b>{student.first_name} {student.last_name}</b> ({student.student_id})\n" \
+               f"📚 Test: {test.subject} — {test.title}\n" \
+               f"❓ Savol: {question.question_text}\n" \
+               f"✍️ E'tiroz: <i>{appeal.message_text}</i>\n" \
+               f"📌 Holati: <b>{appeal.status}</b>"
                
         keyboard = [
-            [InlineKeyboardButton(text="✅ Tasdiqlash (Ball qo'shish)", callback_data=f"app_acc_{appeal.id}")],
-            [InlineKeyboardButton(text="❌ Rad etish", callback_data=f"app_rej_{appeal.id}")]
+            [
+                InlineKeyboardButton(text="✅ Tasdiqlash (+1 ball)", callback_data=f"app_acc_{appeal.id}"),
+                InlineKeyboardButton(text="❌ Rad etish", callback_data=f"app_rej_{appeal.id}")
+            ]
         ]
         await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+        await callback.answer()
 
 @router.callback_query(F.data.startswith("app_acc_"))
-async def accept_appeal(callback: CallbackQuery):
+async def accept_appeal(callback: CallbackQuery, bot: Bot):
     appeal_id = int(callback.data.split("_")[2])
     async with async_session() as session:
         appeal = await session.get(Appeal, appeal_id)
+        if not appeal: return
         appeal.status = "APPROVED"
+        
         ts = await session.get(TestSession, appeal.test_session_id)
-        ts.score += 1.0 # 1 ball qo'shiladi
+        ts.score += 1.0
+        ts.correct_answers += 1
+        
+        questions_count = await session.scalar(select(func.count(Question.id)).where(Question.test_id == ts.test_id))
+        if questions_count > 0:
+            ts.score_percentage = round((ts.score / questions_count) * 100, 2)
+            
         await session.commit()
-    await callback.message.edit_text("✅ Apellyatsiya tasdiqlandi va ball qo'shildi!")
+        
+        student = await session.get(Student, appeal.student_id)
+        test = await session.get(Test, ts.test_id)
+        
+        # Google Sheets jadvalidagi natijani yangilash
+        update_result_in_sheet(student.student_id, test.title, ts.score, ts.score_percentage, ts.correct_answers)
+        
+        if student and student.telegram_id:
+            try:
+                await bot.send_message(
+                    chat_id=student.telegram_id,
+                    text=f"✅ <b>Apellyatsiyangiz ma'qullandi!</b>\n\nBaligacha 1 ball qo'shildi. Hozirgi balingiz: <b>{ts.score}</b>"
+                )
+            except Exception: pass
+            
+    await callback.message.edit_text("✅ Apellyatsiya tasdiqlandi, ball qo'shildi va Google Sheets jadvali yangilandi!")
 
 @router.callback_query(F.data.startswith("app_rej_"))
-async def reject_appeal(callback: CallbackQuery):
+async def reject_appeal(callback: CallbackQuery, bot: Bot):
     appeal_id = int(callback.data.split("_")[2])
     async with async_session() as session:
         appeal = await session.get(Appeal, appeal_id)
+        if not appeal: return
         appeal.status = "REJECTED"
         await session.commit()
+        
+        student = await session.get(Student, appeal.student_id)
+        if student and student.telegram_id:
+            try:
+                await bot.send_message(
+                    chat_id=student.telegram_id,
+                    text=f"❌ <b>Apellyatsiyangiz rad etildi.</b>"
+                )
+            except Exception: pass
+            
     await callback.message.edit_text("❌ Apellyatsiya rad etildi.")
 
 @router.message(F.text == "👥 Adminlar")
