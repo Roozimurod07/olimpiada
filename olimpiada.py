@@ -5,7 +5,7 @@ import random
 import os
 import re
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -70,8 +70,10 @@ class Test(Base):
     subject = Column(String(100), nullable=False)
     grade_level = Column(String(20), nullable=False)
     max_attempts = Column(Integer, default=1)
-    mode = Column(String(20), default="dtm_block") # DTM blok testi rejimi uchun
-    duration_minutes = Column(Integer, default=180) # 3 soatlik umumiy vaqt
+    mode = Column(String(20), default="global_timer")
+    duration_minutes = Column(Integer, default=180) # 3 soat
+    is_block_test = Column(Boolean, default=False)
+    block_subjects = Column(Text, nullable=True) # JSON formatida asosiy fanlar
     start_time = Column(DateTime, nullable=True)
     end_time = Column(DateTime, nullable=True)
     is_active = Column(Boolean, default=True)
@@ -84,7 +86,7 @@ class Question(Base):
     __tablename__ = "questions"
     id = Column(Integer, primary_key=True, autoincrement=True)
     test_id = Column(Integer, ForeignKey("tests.id", ondelete="CASCADE"), nullable=False)
-    subject_type = Column(String(50), default="main_1") # DTM bloklari uchun fan turi: history, native_lang, math, main_1, main_2
+    section_name = Column(String(100), nullable=True) # Fan nomi (Tarix, Ona tili, Matematika, 1-asosiy, 2-asosiy)
     question_text = Column(Text, nullable=False)
     photo_file_id = Column(String(200), nullable=True)
     option_a = Column(Text, nullable=False)
@@ -92,7 +94,7 @@ class Question(Base):
     option_c = Column(Text, nullable=True)
     option_d = Column(Text, nullable=True)
     correct_option = Column(String(5), nullable=False)
-    points = Column(Float, default=1.1)
+    points = Column(Float, default=1.0)
     
     test = relationship("Test", back_populates="questions")
     answers = relationship("Answer", back_populates="question", cascade="all, delete-orphan")
@@ -124,6 +126,13 @@ class Answer(Base):
 
     session = relationship("TestSession", back_populates="answers")
     question = relationship("Question", back_populates="answers")
+
+class Reminder(Base):
+    __tablename__ = "reminders"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    test_id = Column(Integer, ForeignKey("tests.id", ondelete="CASCADE"), nullable=False)
+    student_id = Column(Integer, ForeignKey("students.id", ondelete="CASCADE"), nullable=False)
+    reminded = Column(Boolean, default=False)
 
 class Appeal(Base):
     __tablename__ = "appeals"
@@ -158,7 +167,6 @@ async def is_admin(user_id: int) -> bool:
         adm = (await session.execute(select(Admin).where(Admin.telegram_id == user_id))).scalar_one_or_none()
         return adm is not None
 
-# --- KANALGA OBUNANI TEKSHIRISH ---
 async def check_subscription(user_id: int, bot: Bot) -> bool:
     try:
         member = await bot.get_chat_member(chat_id=REQUIRED_CHANNEL, user_id=user_id)
@@ -168,7 +176,6 @@ async def check_subscription(user_id: int, bot: Bot) -> bool:
         pass
     return False
 
-# --- GOOGLE SHEETS BILAN ISHLASH ---
 def get_gspread_sheet():
     scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     if GOOGLE_CREDS_JSON:
@@ -204,7 +211,6 @@ def update_result_in_sheet(student_id, test_title, score, percentage, correct):
     except Exception as e:
         print(f"❌ Google Sheets yangilash xatosi: {e}")
 
-# --- SERTIFIKAT GENERATSIYA QILISH ---
 def generate_certificate_pdf(student_name, test_title, subject, score_pct):
     pdf_buffer = io.BytesIO()
     c = canvas.Canvas(pdf_buffer, pagesize=landscape(letter))
@@ -256,11 +262,15 @@ class AdminAddStudent(StatesGroup):
 
 class AdminAddTest(StatesGroup):
     waiting_for_title = State()
-    waiting_for_subject_1 = State()
-    waiting_for_subject_2 = State()
+    waiting_for_subject = State()
     waiting_for_grade = State()
+    waiting_for_is_block = State()
+    waiting_for_block_sub1 = State()
+    waiting_for_block_sub2 = State()
     waiting_for_attempts = State()
+    waiting_for_start_time = State()
     waiting_for_questions = State()
+    waiting_for_answers = State()
 
 class AdminBroadcast(StatesGroup):
     waiting_for_message = State()
@@ -279,9 +289,10 @@ router = Router()
 def get_main_menu():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="📚 Blok test ishlash"), KeyboardButton(text="👤 Profilim")],
-            [KeyboardButton(text="📊 Mening urinishlarim"), KeyboardButton(text="⚖️ Apellyatsiya")],
-            [KeyboardButton(text="🏆 Reyting"), KeyboardButton(text="ℹ️ Olimpiada haqida")]
+            [KeyboardButton(text="📝 Testni boshlash"), KeyboardButton(text="🗂 Blok testlar")],
+            [KeyboardButton(text="👤 Profilim"), KeyboardButton(text="📊 Mening urinishlarim")],
+            [KeyboardButton(text="⚖️ Apellyatsiya"), KeyboardButton(text="🏆 Reyting")],
+            [KeyboardButton(text="ℹ️ Olimpiada haqida")]
         ],
         resize_keyboard=True
     )
@@ -290,12 +301,18 @@ def get_admin_menu():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="➕ ID qo'shish"), KeyboardButton(text="📂 Excel orqali ID'lar")],
-            [KeyboardButton(text="➕ Blok test qo'shish (Admin)"), KeyboardButton(text="⚙️ Testlarni boshqarish")],
-            [KeyboardButton(text="📊 Jonli statistika"), KeyboardButton(text="📥 Excel natijalar")],
-            [KeyboardButton(text="⚖️ Apellyatsiyalar"), KeyboardButton(text="👥 Adminlar")],
-            [KeyboardButton(text="🧹 Bazani tozalash"), KeyboardButton(text="📢 Xabar yuborish")],
-            [KeyboardButton(text="⬅️ Bosh menyu")]
+            [KeyboardButton(text="📂 Test yuklash"), KeyboardButton(text="🧩 Blok test yuklash")],
+            [KeyboardButton(text="⚙️ Testlarni boshqarish"), KeyboardButton(text="📊 Jonli statistika")],
+            [KeyboardButton(text="📥 Excel natijalar"), KeyboardButton(text="⚖️ Apellyatsiyalar")],
+            [KeyboardButton(text="👥 Adminlar"), KeyboardButton(text="📢 Xabar yuborish")],
+            [KeyboardButton(text="🧹 Bazani tozalash"), KeyboardButton(text="⬅️ Bosh menyu")]
         ],
+        resize_keyboard=True
+    )
+
+def get_finish_test_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="✅ Testni yakunlash va saqlash")]],
         resize_keyboard=True
     )
 
@@ -424,7 +441,7 @@ async def my_attempts_handler(message: Message, state: FSMContext):
         text = "📊 <b>Sizning ishlagan testlaringiz natijalari:</b>\n\n"
         for ts, t in sessions:
             date_str = ts.finished_at.strftime("%Y-%m-%d %H:%M") if ts.finished_at else ""
-            status_text = "🟢 Test yakunlangan (Natijalar ochiq)" if t.is_finished else "🟡 Test hali davom etmoqda"
+            status_text = "🟢 Test yakunlangan (Natijalar ochiq)" if t.is_finished else "🟡 Test hali davom etmoqda (Tahlil va apellyatsiya yopilgan)"
             text += f"📚 <b>{t.subject}</b> ({t.title})\n⭐ Ball: {ts.score} ({ts.score_percentage}%)\n📅 Sana: {date_str}\nStatus: {status_text}\n----------------------------------\n"
             
         await message.answer(text)
@@ -481,7 +498,8 @@ async def show_test_analysis_for_appeal(callback: CallbackQuery):
         for idx, q in enumerate(questions, 1):
             sel = answers.get(q.id, "Javob berilmagan")
             status = "✅" if sel == q.correct_option else "❌"
-            text += f"<b>{idx}. [{q.subject_type}] {q.question_text}</b>\nSizning javob: <b>{sel}</b> {status} | To'g'ri: <b>{q.correct_option}</b>\n\n"
+            sec = f"[{q.section_name}] " if q.section_name else ""
+            text += f"<b>{idx}. {sec}{q.question_text}</b>\nSizning javob: <b>{sel}</b> {status} | To'g'ri: <b>{q.correct_option}</b>\n\n"
             keyboard.append([InlineKeyboardButton(text=f"⚖️ {idx}-savolga apellyatsiya", callback_data=f"appeal_q_{ts.id}_{q.id}")])
             
         keyboard.append([InlineKeyboardButton(text="🎓 Sertifikatni yuklab olish", callback_data=f"get_cert_{ts.id}")])
@@ -543,10 +561,10 @@ async def process_appeal_text(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("✅ Apellyatsiyangiz adminga yuborildi. Tez orada ko'rib chiqiladi!", reply_markup=get_main_menu())
 
-# --- DTM BLOK TEST ISHLASH & GLOBAL TAYMER (3 SOAT) ---
-@router.message(F.text == "📚 Blok test ishlash")
-async def list_block_tests(message: Message, state: FSMContext):
+@router.message(F.text.in_(["📝 Testni boshlash", "🗂 Blok testlar"]))
+async def start_test_prompt(message: Message, state: FSMContext):
     if await state.get_state() == TestProcessState.in_test.state: return
+    is_block = (message.text == "🗂 Blok testlar")
     async with async_session() as session:
         student = (await session.execute(select(Student).where(Student.telegram_id == message.from_user.id))).scalar_one_or_none()
         if not student or not student.grade:
@@ -554,29 +572,41 @@ async def list_block_tests(message: Message, state: FSMContext):
             return
 
         tests = (await session.execute(
-            select(Test).where(Test.is_active == True, Test.is_finished == False, Test.grade_level == student.grade)
+            select(Test).where(
+                Test.is_active == True, 
+                Test.is_finished == False, 
+                Test.grade_level == student.grade,
+                Test.is_block_test == is_block
+            )
         )).scalars().all()
         
         if not tests:
-            await message.answer(f"⚠️ Hozirda <b>{student.grade}</b> uchun faol blok testlar mavjud emas.")
+            title_type = "blok testlar" if is_block else "oddiy testlar"
+            await message.answer(f"⚠️ Hozirda <b>{student.grade}</b> uchun faol {title_type} mavjud emas.")
             return
 
-        kb = []
-        for t in tests:
-            kb.append([InlineKeyboardButton(text=f"📌 {t.title} ({t.subject})", callback_data=f"start_btest_{t.id}")])
-            
-        await message.answer("Mavjud blok testlardan birini tanlang:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+        keyboard_buttons = [[InlineKeyboardButton(text=f"📚 {t.subject} — {t.title}", callback_data=f"start_test_{t.id}")] for t in tests]
+        menu_title = "🗂 <b>Mavjud blok testlar:</b>" if is_block else "📝 <b>Mavjud testlar:</b>"
+        await message.answer(f"{menu_title}\n\nTestni tanlang:", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_buttons))
 
-@router.callback_query(F.data.startswith("start_btest_"))
-async def start_user_block_test(callback: CallbackQuery, state: FSMContext, bot: Bot):
+@router.callback_query(F.data.startswith("start_test_"))
+async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bot):
     test_id = int(callback.data.split("_")[2])
     
     async with async_session() as session:
         student = (await session.execute(select(Student).where(Student.telegram_id == callback.from_user.id))).scalar_one_or_none()
-        test = await session.get(Test, test_id)
+        test = (await session.execute(select(Test).where(Test.id == test_id))).scalar_one_or_none()
         
         if not test or not test.is_active or test.is_finished:
             await callback.answer("Bu test topilmadi yoki yopilgan!", show_alert=True)
+            return
+
+        now = datetime.utcnow()
+        if test.start_time and now < test.start_time:
+            await callback.answer(f"⏳ Test hali boshlanmagan! Boshlanish vaqti: {test.start_time.strftime('%Y-%m-%d %H:%M')}", show_alert=True)
+            return
+        if test.end_time and now > test.end_time:
+            await callback.answer("⏰ Bu testning vaqti tugagan!", show_alert=True)
             return
 
         if test.max_attempts > 0:
@@ -591,179 +621,149 @@ async def start_user_block_test(callback: CallbackQuery, state: FSMContext, bot:
                 await callback.answer(f"❌ Urinishlar soni tugagan: {test.max_attempts}", show_alert=True)
                 return
 
-        rows = (await session.execute(select(Question).where(Question.test_id == test_id))).scalars().all()
-        if not rows:
-            await callback.answer("Bu testda savollar topilmadi!", show_alert=True)
+        questions = (await session.execute(select(Question).where(Question.test_id == test_id))).scalars().all()
+        if not questions:
+            await callback.answer("Bu testda savollar yo'q!", show_alert=True)
             return
-            
-        questions = []
-        for r in rows:
-            questions.append({
-                'id': r.id, 'subject': r.subject_type, 'text': r.question_text, 'photo': r.photo_file_id,
-                'options': [r.option_a, r.option_b, r.option_c, r.option_d]
-            })
             
         test_session = TestSession(student_id=student.id, test_id=test_id, status="IN_PROGRESS")
         session.add(test_session)
         await session.commit()
         await session.refresh(test_session)
 
-        await state.update_data(
-            test_session_id=test_session.id,
-            test_id=test_id,
-            questions=questions,
-            current_index=0,
-            user_answers={},
-            active_session=True
-        )
+        await callback.message.edit_text(f"🚀 <b>{test.subject} ({test.title})</b> testi boshlandi!\n⏱ Umumiy vaqt: {test.duration_minutes} daqiqa.")
+        user_id = callback.from_user.id
         await state.set_state(TestProcessState.in_test)
         
-        await callback.message.answer(
-            "⏱ **Blok test boshlandi!**\n"
-            "Sizga umumiy **3 soat** vaqt berildi. Savollar ketma-ket ko'rsatiladi:", parse_mode="Markdown"
-        )
+        total_duration_sec = test.duration_minutes * 60
+        start_timestamp = datetime.utcnow()
         
-        # 3 soatlik global taymer fonda ishga tushadi (3 * 3600 soniya)
-        asyncio.create_task(block_test_timer(bot, callback.from_user.id, test_id, test_session.id, state))
-        
-        await send_block_question(callback.message, state, bot)
+        for index, q in enumerate(questions):
+            current_test_check = await session.get(Test, test_id)
+            if not current_test_check.is_active or current_test_check.is_finished:
+                break
 
-async def block_test_timer(bot: Bot, user_id: int, test_id: int, session_id: int, state: FSMContext):
-    await asyncio.sleep(3 * 60 * 60) # 3 soat
-    data = await state.get_data()
-    if data.get('active_session') and data.get('test_id') == test_id:
-        async with async_session() as session:
-            sess = await session.get(TestSession, session_id)
+            # Vaqt tugaganini tekshirish
+            elapsed = (datetime.utcnow() - start_timestamp).total_seconds()
+            if elapsed >= total_duration_sec:
+                await bot.send_message(chat_id=user_id, text="⏰ Test uchun ajratilgan umumiy vaqt tugadi!")
+                break
+
+            options = [("A", q.option_a), ("B", q.option_b)]
+            if q.option_c: options.append(("C", q.option_c))
+            if q.option_d: options.append(("D", q.option_d))
+            
+            keyboard_buttons = []
+            row = []
+            for opt_key, text_val in options:
+                row.append(InlineKeyboardButton(text=f"{opt_key}) {text_val}", callback_data=f"ans_{test_session.id}_{q.id}_{opt_key}"))
+                if len(row) == 2:
+                    keyboard_buttons.append(row)
+                    row = []
+            if row: keyboard_buttons.append(row)
+            
+            nav_row = []
+            if index > 0:
+                nav_row.append(InlineKeyboardButton(text="⬅️ Oldingi", callback_data=f"navigate_{test_session.id}_{index - 1}"))
+            if index < len(questions) - 1:
+                nav_row.append(InlineKeyboardButton(text="Keyingi ➡️", callback_data=f"navigate_{test_session.id}_{index + 1}"))
+            if nav_row:
+                keyboard_buttons.append(nav_row)
+            
+            keyboard_buttons.append([InlineKeyboardButton(text="🏁 Testni yakunlash", callback_data=f"finish_early_{test_session.id}")])
+            markup = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+            
+            sec_title = f"<b>Fan / Bo'lim: {q.section_name}</b>\n" if q.section_name else ""
+            text_content = f"{sec_title}<b>Savol {index + 1} / {len(questions)}</b> (Ball: {q.points})\n\n{q.question_text}"
+            
+            if q.photo_file_id:
+                q_msg = await bot.send_photo(chat_id=user_id, photo=q.photo_file_id, caption=text_content, reply_markup=markup)
+            else:
+                q_msg = await bot.send_message(chat_id=user_id, text=text_content, reply_markup=markup)
+            
+            # Global taymer bilan kutish (foydalanuvchi javob berguncha yoki keyingi/oldingiga o'tguncha)
+            # Har sekundda tekshirib turamiz
+            while True:
+                await asyncio.sleep(1)
+                now_el = (datetime.utcnow() - start_timestamp).total_seconds()
+                if now_el >= total_duration_sec:
+                    break
+                # Agar state o'zgargan bo'lsa yoki savol almashgan bo'lsa chiqib ketadi
+                if user_id not in user_next_question_flags or user_next_question_flags[user_id].get("target_index") != index:
+                    break
+            
+            try: await bot.delete_message(chat_id=user_id, message_id=q_msg.message_id)
+            except Exception: pass
+            
+            if (datetime.utcnow() - start_timestamp).total_seconds() >= total_duration_sec:
+                break
+
+        async with async_session() as final_session:
+            sess = await final_session.get(TestSession, test_session.id)
             if sess and sess.status == "IN_PROGRESS":
                 sess.status = "COMPLETED"
                 sess.finished_at = datetime.utcnow()
-                await calculate_dtm_results(session, sess)
-                await session.commit()
+                await calculate_and_save_results(final_session, sess)
+                await final_session.commit()
                 
-                student_obj = await session.get(Student, sess.student_id)
-                test_obj = await session.get(Test, sess.test_id)
+                student_obj = await final_session.get(Student, sess.student_id)
+                test_obj = await final_session.get(Test, sess.test_id)
                 if student_obj and test_obj:
                     save_result_to_sheet(student_obj.student_id, f"{student_obj.first_name} {student_obj.last_name}", student_obj.age or "-", student_obj.school or "-", student_obj.grade or "-", test_obj.title, test_obj.subject, sess.score, sess.score_percentage, sess.correct_answers, sess.wrong_answers)
                 
                 await state.clear()
-                await bot.send_message(user_id, "⏰ **Vaqt tugadi!** 3 soatlik vaqt o'z nihoyasiga yetdi. Test avtomatik yakunlandi.", reply_markup=get_main_menu())
+                await bot.send_message(chat_id=user_id, text=f"🏆 <b>TEST YAKUNLANDI!</b>\n\nNatijangiz: {sess.score} ball ({sess.score_percentage}%).", reply_markup=get_main_menu())
 
-async def send_block_question(message: Message, state: FSMContext, bot: Bot):
-    data = await state.get_data()
-    questions = data['questions']
-    index = data['current_index']
-    
-    if index >= len(questions):
-        await finish_block_test(bot, message.chat.id, state)
-        return
-        
-    q = questions[index]
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="A", callback_data=f"b_ans_{q['id']}_A"),
-            InlineKeyboardButton(text="B", callback_data=f"b_ans_{q['id']}_B"),
-            InlineKeyboardButton(text="C", callback_data=f"b_ans_{q['id']}_C"),
-            InlineKeyboardButton(text="D", callback_data=f"b_ans_{q['id']}_D"),
-        ]
-    ])
-    
-    text = f"<b>{index + 1}-savol (Fan bloki: {q['subject']}):</b>\n\n{q['text']}\n\nA) {q['options'][0]}\nB) {q['options'][1]}\nC) {q['options'][2]}\nD) {q['options'][3]}"
-    
-    if q['photo']:
-        await bot.send_photo(chat_id=message.chat.id, photo=q['photo'], caption=text, reply_markup=kb, parse_mode="HTML")
-    else:
-        await bot.send_message(chat_id=message.chat.id, text=text, reply_markup=kb, parse_mode="HTML")
+user_next_question_flags = {}
 
-@router.callback_query(F.data.startswith("b_ans_"), TestProcessState.in_test)
-async def process_user_answer(callback: CallbackQuery, state: FSMContext, bot: Bot):
-    data = callback.data.split("_")
-    q_id = int(data[2])
-    ans = data[3]
-    
-    st_data = await state.get_data()
-    session_id = st_data['test_session_id']
-    user_answers = st_data['user_answers']
-    user_answers[q_id] = ans
-    
+@router.callback_query(F.data.startswith("ans_"))
+async def save_answer(callback: CallbackQuery, bot: Bot):
+    parts = callback.data.split("_")
+    session_id, question_id, selected = int(parts[1]), int(parts[2]), parts[3]
     async with async_session() as session:
-        existing = (await session.execute(select(Answer).where(Answer.session_id == session_id, Answer.question_id == q_id))).scalar_one_or_none()
-        if existing: existing.selected_option = ans
-        else: session.add(Answer(session_id=session_id, question_id=q_id, selected_option=ans))
+        existing = (await session.execute(select(Answer).where(Answer.session_id == session_id, Answer.question_id == question_id))).scalar_one_or_none()
+        if existing: existing.selected_option = selected
+        else: session.add(Answer(session_id=session_id, question_id=question_id, selected_option=selected))
         await session.commit()
-    
-    await state.update_data(user_answers=user_answers, current_index=st_data['current_index'] + 1)
-    
-    try: await callback.message.delete()
-    except Exception: pass
-    
-    await callback.answer(f"Tanlandi: {ans}")
-    await send_block_question(callback.message, state, bot)
+    await callback.answer(f"Tanlandi: {selected}")
 
-async def calculate_dtm_results(session, sess: TestSession):
+@router.callback_query(F.data.startswith("navigate_"))
+async def navigate_question(callback: CallbackQuery, bot: Bot):
+    parts = callback.data.split("_")
+    user_id = callback.from_user.id
+    target_idx = int(parts[2])
+    user_next_question_flags[user_id] = {"target_index": target_idx}
+    await callback.answer()
+    try: await callback.message.delete()
+    except: pass
+
+@router.callback_query(F.data.startswith("finish_early_"))
+async def finish_early_callback(callback: CallbackQuery, bot: Bot):
+    user_id = callback.from_user.id
+    user_next_question_flags[user_id] = {"target_index": 999999}
+    await callback.answer("Test yakunlanmoqda...")
+    try: await callback.message.delete()
+    except: pass
+
+async def calculate_and_save_results(session, sess: TestSession):
     questions = (await session.execute(select(Question).where(Question.test_id == sess.test_id))).scalars().all()
     answers = {a.question_id: a.selected_option for a in (await session.execute(select(Answer).where(Answer.session_id == sess.id))).scalars().all()}
-    
-    # DTM Ballarni hisoblash qoidasi:
-    # Majburiy fanlar (history, native_lang, math) - har biri 1.1 balldan.
-    # 1-asosiy fan (main_1) - 3.1 balldan.
-    # 2-asosiy fan (main_2) - 2.1 balldan.
-    weights = {
-        'history': 1.1,
-        'native_lang': 1.1,
-        'math': 1.1,
-        'main_1': 3.1,
-        'main_2': 2.1
-    }
     
     correct, wrong, unanswered, total_score = 0, 0, 0, 0.0
     for q in questions:
         sel = answers.get(q.id)
-        if not sel: 
-            unanswered += 1
+        if not sel: unanswered += 1
         elif sel == q.correct_option:
             correct += 1
-            total_score += weights.get(q.subject_type, 1.1)
-        else: 
-            wrong += 1
+            total_score += q.points
+        else: wrong += 1
             
+    total_q = len(questions)
     sess.correct_answers = correct
     sess.wrong_answers = wrong
     sess.unanswered = unanswered
     sess.score = round(total_score, 2)
-    sess.score_percentage = round((correct / len(questions)) * 100, 2) if len(questions) > 0 else 0.0
-
-async def finish_block_test(bot: Bot, user_id: int, state: FSMContext):
-    data = await state.get_data()
-    if not data.get('active_session'):
-        return
-        
-    session_id = data['test_session_id']
-    test_id = data['test_id']
-    
-    async with async_session() as session:
-        sess = await session.get(TestSession, session_id)
-        if sess and sess.status == "IN_PROGRESS":
-            sess.status = "COMPLETED"
-            sess.finished_at = datetime.utcnow()
-            await calculate_dtm_results(session, sess)
-            await session.commit()
-            
-            student_obj = await session.get(Student, sess.student_id)
-            test_obj = await session.get(Test, sess.test_id)
-            if student_obj and test_obj:
-                save_result_to_sheet(student_obj.student_id, f"{student_obj.first_name} {student_obj.last_name}", student_obj.age or "-", student_obj.school or "-", student_obj.grade or "-", test_obj.title, test_obj.subject, sess.score, sess.score_percentage, sess.correct_answers, sess.wrong_answers)
-            
-            await state.clear()
-            
-            await bot.send_message(
-                user_id,
-                f"📊 **Blok test yakunlandi!**\n\n"
-                f"✅ To'g'ri javoblar: {sess.correct_answers} ta\n"
-                f"🎯 To'plangan umumiy ball: **{sess.score}** ball",
-                parse_mode="Markdown",
-                reply_markup=get_main_menu()
-            )
+    sess.score_percentage = round((correct / total_q) * 100, 2) if total_q > 0 else 0.0
 
 @router.message(F.text == "🏆 Reyting")
 async def rating_menu_prompt(message: Message, state: FSMContext):
@@ -800,7 +800,7 @@ async def show_specific_test_rating(callback: CallbackQuery):
 @router.message(F.text == "ℹ️ Olimpiada haqida")
 async def about_handler(message: Message, state: FSMContext):
     if await state.get_state() == TestProcessState.in_test.state: return
-    await message.answer("ℹ️ Professional DTM Blok Test Tizimi v2.5 — 3 soatlik global taymer va DTM ballar tizimi bilan.")
+    await message.answer("ℹ️ Professional Olimpiada Tizimi v3.0 — DTM blok testlar va global taymer bilan.")
 
 @router.message(Command("admin"))
 async def admin_panel(message: Message, state: FSMContext):
@@ -856,124 +856,279 @@ async def admin_process_excel_students(message: Message, state: FSMContext, bot:
     except Exception as e:
         await message.answer(f"❌ Xatolik: {e}")
 
-# --- ADMIN: DTM BLOK TEST QO'SHISH ---
-@router.message(F.text == "➕ Blok test qo'shish (Admin)")
-async def admin_add_test(message: Message, state: FSMContext):
+@router.message(F.text == "📂 Test yuklash")
+async def admin_add_test_start(message: Message, state: FSMContext):
     if not await is_admin(message.from_user.id): return
-    await message.answer("Blok test nomini kiriting (masalan: '1-sonli DTM imtihoni'):")
+    await state.update_data(is_block=False)
     await state.set_state(AdminAddTest.waiting_for_title)
+    await message.answer("📂 Test sarlavhasini kiriting:")
+
+@router.message(F.text == "🧩 Blok test yuklash")
+async def admin_add_block_test_start(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id): return
+    await state.update_data(is_block=True)
+    await state.set_state(AdminAddTest.waiting_for_title)
+    await message.answer("🧩 DTM Blok test sarlavhasini kiriting:")
 
 @router.message(AdminAddTest.waiting_for_title)
-async def process_test_title(message: Message, state: FSMContext):
+async def admin_get_title(message: Message, state: FSMContext):
     await state.update_data(title=message.text.strip())
-    await message.answer("1-asosiy fan nomini kiriting (masalan: Fizika):")
-    await state.set_state(AdminAddTest.waiting_for_subject_1)
+    data = await state.get_data()
+    if data.get("is_block"):
+        await state.set_state(AdminAddTest.waiting_for_grade)
+        await message.answer("Sinfni kiriting (masalan: `11-sinf`):")
+    else:
+        await state.set_state(AdminAddTest.waiting_for_subject)
+        await message.answer("Fan nomini kiriting:")
 
-@router.message(AdminAddTest.waiting_for_subject_1)
-async def process_sub_1(message: Message, state: FSMContext):
-    await state.update_data(subject_1=message.text.strip())
-    await message.answer("2-asosiy fan nomini kiriting (masalan: Ingliz tili):")
-    await state.set_state(AdminAddTest.waiting_for_subject_2)
-
-@router.message(AdminAddTest.waiting_for_subject_2)
-async def process_sub_2(message: Message, state: FSMContext):
-    await state.update_data(subject_2=message.text.strip())
-    await message.answer("Sinfni kiriting (masalan: `11-sinf`):")
+@router.message(AdminAddTest.waiting_for_subject)
+async def admin_get_subject(message: Message, state: FSMContext):
+    await state.update_data(subject=message.text.strip())
     await state.set_state(AdminAddTest.waiting_for_grade)
+    await message.answer("Sinfni kiriting (masalan: `11-sinf`):")
 
 @router.message(AdminAddTest.waiting_for_grade)
-async def process_test_grade(message: Message, state: FSMContext):
+async def admin_get_grade(message: Message, state: FSMContext):
     await state.update_data(grade=message.text.strip())
-    await message.answer("Maksimal urinishlar sonini kiriting (masalan: 1):")
-    await state.set_state(AdminAddTest.waiting_for_attempts)
+    data = await state.get_data()
+    if data.get("is_block"):
+        await state.set_state(AdminAddTest.waiting_for_block_sub1)
+        await message.answer("1-asosiy fanning nomini kiriting (masalan: Matematika yoki Fizika):")
+    else:
+        await state.set_state(AdminAddTest.waiting_for_attempts)
+        await message.answer("Maksimal urinishlar sonini kiriting (masalan: 1):")
+
+@router.message(AdminAddTest.waiting_for_block_sub1)
+async def admin_get_block_sub1(message: Message, state: FSMContext):
+    await state.update_data(block_sub1=message.text.strip())
+    await state.set_state(AdminAddTest.waiting_for_block_sub2)
+    await message.answer("2-asosiy fanning nomini kiriting (masalan: Ingliz tili yoki Kimyo):")
+
+@router.message(AdminAddTest.waiting_for_block_sub2)
+async def admin_get_block_sub2(message: Message, state: FSMContext):
+    await state.update_data(block_sub2=message.text.strip(), max_attempts=1)
+    await state.set_state(AdminAddTest.waiting_for_start_time)
+    await message.answer("Test boshlanish vaqtini kiriting (Format: `YYYY-MM-DD HH:MM`, masalan: `2026-06-01 10:00` yoki `-`):")
 
 @router.message(AdminAddTest.waiting_for_attempts)
-async def process_test_attempts(message: Message, state: FSMContext):
+async def admin_get_attempts(message: Message, state: FSMContext):
     try: att = int(message.text.strip())
     except: att = 1
+    await state.update_data(max_attempts=att)
+    await state.set_state(AdminAddTest.waiting_for_start_time)
+    await message.answer("Test boshlanish vaqtini kiriting (Format: `YYYY-MM-DD HH:MM`, masalan: `2026-06-01 10:00` yoki `-`):")
+
+@router.message(AdminAddTest.waiting_for_start_time)
+async def admin_get_start_time(message: Message, state: FSMContext):
+    txt = message.text.strip()
+    start_dt = None
+    if txt != "-":
+        try:
+            start_dt = datetime.strptime(txt, "%Y-0%m-%d %H:%M" if len(txt)==16 else "%Y-%m-%d %H:%M")
+        except:
+            try:
+                start_dt = datetime.strptime(txt, "%Y-%m-%d %H:%M")
+            except:
+                pass
+    await state.update_data(start_time=start_dt, questions=[])
+    await state.set_state(AdminAddTest.waiting_for_questions)
     
     data = await state.get_data()
+    if data.get("is_block"):
+        await message.answer(
+            "🧩 <b>Blok test uchun savollarni yuboring:</b>\n"
+            "Tartib bo'yicha: \n1) Tarix (10 ta)\n2) Ona tili (10 ta)\n3) Matematika (10 ta)\n4) 1-asosiy fan (30 ta)\n5) 2-asosiy fan (30 ta)\n\n"
+            "Matn yoki Word/PDF fayl ko'rinishida yuborishingiz mumkin.", reply_markup=get_finish_test_keyboard()
+        )
+    else:
+        await message.answer("📂 Savollarni matn yoki Word/PDF fayl ko'rinishida yuboring (rasmli savollarni rasm va tagiga matn qilib yuborishingiz mumkin).", reply_markup=get_finish_test_keyboard())
+
+@router.message(AdminAddTest.waiting_for_questions, F.photo)
+async def admin_handle_photo_question(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id): return
+    photo_id = message.photo[-1].file_id
+    caption = message.caption or ""
+    data = await state.get_data()
+    q_list = data.get("questions", [])
+    
+    # Rasmli savolni qo'shamiz
+    parsed = parse_single_question_text(caption)
+    if parsed:
+        parsed["photo_file_id"] = photo_id
+        q_list.append(parsed)
+        await state.update_data(questions=q_list)
+        await message.answer(f"📸 Rasmli savol qo'shildi! Jami savollar: {len(q_list)}")
+    else:
+        await message.answer("❌ Rasm tagiga savol va variantlarni (A, B, C, D) to'g'ri formatda yozing!")
+
+@router.message(AdminAddTest.waiting_for_questions, F.document)
+async def admin_handle_document(message: Message, state: FSMContext, bot: Bot):
+    if not await is_admin(message.from_user.id): return
+    document = message.document
+    file_info = await bot.get_file(document.file_id)
+    downloaded = await bot.download_file(file_info.file_path)
+    file_path = f"temp_{document.file_name}"
+    with open(file_path, "wb") as f: f.write(downloaded.read())
+    
+    extracted_text = ""
+    try:
+        if document.file_name.endswith('.pdf'):
+            reader = pypdf.PdfReader(file_path)
+            for page in reader.pages: extracted_text += page.extract_text() + "\n"
+        elif document.file_name.endswith('.docx'):
+            doc = docx.Document(file_path)
+            for para in doc.paragraphs: extracted_text += para.text + "\n"
+    except Exception as e:
+        await message.answer(f"Xatolik: {e}")
+        return
+    finally:
+        if os.path.exists(file_path): os.remove(file_path)
+        
+    added = await parse_and_add_questions(extracted_text, state)
+    data = await state.get_data()
+    await message.answer(f"✅ Fayldan {added} ta savol qo'shildi! Jami: {len(data.get('questions', []))}")
+
+@router.message(AdminAddTest.waiting_for_questions, F.text == "✅ Testni yakunlash va saqlash")
+async def admin_ask_for_answers(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id): return
+    data = await state.get_data()
+    if not data.get("questions"):
+        await message.answer("❌ Savollar mavjud emas!")
+        return
+    await state.set_state(AdminAddTest.waiting_for_answers)
+    await message.answer("🔑 To'g'ri javoblarni ketma-ketlikda yuboring (masalan: `A B C D A...`):", reply_markup=get_admin_menu())
+
+@router.message(AdminAddTest.waiting_for_questions, F.text)
+async def admin_add_bulk_questions_text(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id): return
+    added = await parse_and_add_questions(message.text, state)
+    data = await state.get_data()
+    await message.answer(f"✅ {added} ta savol qo'shildi! Jami: {len(data.get('questions', []))}")
+
+def parse_single_question_text(text: str) -> dict:
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    a_idx, b_idx, c_idx, d_idx = -1, -1, -1, -1
+    for j in range(len(lines)):
+        l = lines[j].lower()
+        if l.startswith("a)") or l.startswith("a."): a_idx = j
+        elif l.startswith("b)") or l.startswith("b."): b_idx = j
+        elif l.startswith("c)") or l.startswith("c."): c_idx = j
+        elif l.startswith("d)") or l.startswith("d."): d_idx = j
+
+    if a_idx != -1 and b_idx != -1:
+        q_text = " ".join(lines[:a_idx])
+        return {
+            "text": q_text, 
+            "a": re.sub(r'^[aA][\.\)]\s*', '', lines[a_idx]), 
+            "b": re.sub(r'^[bB][\.\)]\s*', '', lines[b_idx]),
+            "c": re.sub(r'^[cC][\.\)]\s*', '', lines[c_idx]) if c_idx != -1 else "C",
+            "d": re.sub(r'^[dD][\.\)]\s*', '', lines[d_idx]) if d_idx != -1 else "D",
+            "correct": "A",
+            "photo_file_id": None
+        }
+    return None
+
+async def parse_and_add_questions(text: str, state: FSMContext) -> int:
+    data = await state.get_data()
+    questions_list = data.get("questions", [])
+    lines = [line.strip() for line in text.split("\n") if line.strip()]
+    added = 0
+    i = 0
+    while i < len(lines):
+        a_idx, b_idx, c_idx, d_idx = -1, -1, -1, -1
+        for j in range(i + 1, min(i + 6, len(lines))):
+            l = lines[j].lower()
+            if l.startswith("a)") or l.startswith("a."): a_idx = j
+            elif l.startswith("b)") or l.startswith("b."): b_idx = j
+            elif l.startswith("c)") or l.startswith("c."): c_idx = j
+            elif l.startswith("d)") or l.startswith("d."): d_idx = j
+
+        if a_idx != -1 and b_idx != -1:
+            q_text = " ".join(lines[i:a_idx])
+            questions_list.append({
+                "text": q_text, 
+                "a": re.sub(r'^[aA][\.\)]\s*', '', lines[a_idx]), 
+                "b": re.sub(r'^[bB][\.\)]\s*', '', lines[b_idx]),
+                "c": re.sub(r'^[cC][\.\)]\s*', '', lines[c_idx]) if c_idx != -1 else "C",
+                "d": re.sub(r'^[dD][\.\)]\s*', '', lines[d_idx]) if d_idx != -1 else "D",
+                "correct": "A",
+                "photo_file_id": None
+            })
+            added += 1
+            i = max(a_idx, b_idx, c_idx, d_idx) + 1
+        else: i += 1
+    await state.update_data(questions=questions_list)
+    return added
+
+@router.message(AdminAddTest.waiting_for_answers)
+async def admin_save_answers_and_test(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id): return
+    tokens = re.findall(r'[A-D]', message.text.upper())
+    data = await state.get_data()
+    questions_list = data.get("questions", [])
+    
+    for idx, q in enumerate(questions_list):
+        if idx < len(tokens): q["correct"] = tokens[idx]
+
+    is_block = data.get("is_block", False)
+    
     async with async_session() as session:
         new_test = Test(
             title=data["title"], 
-            subject=f"{data['subject_1']} + {data['subject_2']}", 
+            subject="Blok Test" if is_block else data["subject"], 
             grade_level=data["grade"],
-            max_attempts=att, 
+            max_attempts=data["max_attempts"], 
+            mode="global_timer",
+            duration_minutes=180, # 3 soat
+            is_block_test=is_block,
+            block_subjects=json.dumps({"sub1": data.get("block_sub1"), "sub2": data.get("block_sub2")}) if is_block else None,
+            start_time=data.get("start_time"),
+            end_time=data.get("start_time") + timedelta(hours=5) if data.get("start_time") else None,
             is_active=True, 
             is_finished=False
         )
         session.add(new_test)
         await session.flush()
-        await session.commit()
-        test_id = new_test.id
         
-    sub_1_name = data['subject_1']
-    sub_2_name = data['subject_2']
-    
-    await state.update_data(test_id=test_id, current_subject='history', q_count=0, sub_1_name=sub_1_name, sub_2_name=sub_2_name)
-    await message.answer(
-        f"✅ Blok test yaratildi!\n"
-        f"Endi savollarni kiritishni boshlaymiz.\n\n"
-        f"1️⃣ **Tarix** fanidan 1-savolni yuboring (Format: Savol matni | A) ... | B) ... | C) ... | D) ... | To'g'ri javob [A/B/C/D])\n"
-        f"*(Agar rasm bo'lsa, rasmli xabar sifatida yuborishingiz mumkin)*"
-    )
-    await state.set_state(AdminAddTest.waiting_for_questions)
-
-@router.message(AdminAddTest.waiting_for_questions)
-async def process_question_adding(message: Message, state: FSMContext):
-    if not await is_admin(message.from_user.id): return
-    data = await state.get_data()
-    test_id = data['test_id']
-    subject = data['current_subject']
-    q_count = data['q_count'] + 1
-    
-    text = message.text or message.caption or ""
-    photo = message.photo[-1].file_id if message.photo else None
-    
-    try:
-        parts = text.split("|")
-        q_text = parts[0].strip()
-        opt_a = parts[1].strip()
-        opt_b = parts[2].strip()
-        opt_c = parts[3].strip()
-        opt_d = parts[4].strip()
-        correct = parts[5].strip().upper()
-    except Exception:
-        await message.answer("❌ Xato format! Qaytadan quyidagicha yuboring:\n`Savol matni | A) ... | B) ... | C) ... | D) ... | A`", parse_mode="Markdown")
-        return
-
-    # Ballarni to'g'ri belgilash
-    weights = {'history': 1.1, 'native_lang': 1.1, 'math': 1.1, 'main_1': 3.1, 'main_2': 2.1}
-    pts = weights.get(subject, 1.1)
-
-    async with async_session() as session:
-        session.add(Question(
-            test_id=test_id, subject_type=subject, question_text=q_text, photo_file_id=photo,
-            option_a=opt_a, option_b=opt_b, option_c=opt_c, option_d=opt_d, correct_option=correct, points=pts
-        ))
-        await session.commit()
-    
-    limits = {'history': 10, 'native_lang': 10, 'math': 10, 'main_1': 30, 'main_2': 30}
-    
-    if q_count >= limits[subject]:
-        if subject == 'history':
-            next_sub, sub_name = 'native_lang', "Ona tili"
-        elif subject == 'native_lang':
-            next_sub, sub_name = 'math', "Matematika"
-        elif subject == 'math':
-            next_sub, sub_name = 'main_1', data['sub_1_name']
-        elif subject == 'main_1':
-            next_sub, sub_name = 'main_2', data['sub_2_name']
-        else:
-            await message.answer("🎉 Tabriklayman! Barcha 90 ta savol muvaffaqiyatli yuklandi.", reply_markup=get_admin_menu())
-            await state.clear()
-            return
+        for idx, q in enumerate(questions_list):
+            sec_name = None
+            points = 1.0
+            if is_block:
+                if idx < 10:
+                    sec_name = "Tarix"
+                    points = 1.1
+                elif idx < 20:
+                    sec_name = "Ona tili"
+                    points = 1.1
+                elif idx < 30:
+                    sec_name = "Matematika"
+                    points = 1.1
+                elif idx < 60:
+                    sec_name = data.get("block_sub1")
+                    points = 3.1
+                else:
+                    sec_name = data.get("block_sub2")
+                    points = 2.1
             
-        await state.update_data(current_subject=next_sub, q_count=0)
-        await message.answer(f"✅ {subject} fanidan savollar tugadi.\n\nEndi **{sub_name}** fanidan 1-savolni yuboring:")
-    else:
-        await state.update_data(q_count=q_count)
-        await message.answer(f"✅ Savol saqlandi ({q_count}/{limits[subject]}). Keyingisini yuboring:")
+            session.add(Question(
+                test_id=new_test.id, 
+                section_name=sec_name,
+                question_text=q["text"],
+                photo_file_id=q.get("photo_file_id"),
+                option_a=q["a"], option_b=q["b"], option_c=q["c"], option_d=q["d"],
+                correct_option=q["correct"],
+                points=points
+            ))
+            
+        # Eslatmalarni tayyorlash
+        if data.get("start_time"):
+            students = (await session.execute(select(Student).where(Student.grade == data["grade"], Student.telegram_id.is_not(None)))).scalars().all()
+            for st in students:
+                session.add(Reminder(test_id=new_test.id, student_id=st.id, reminded=False))
+                
+        await session.commit()
+    await state.clear()
+    await message.answer("✅ Test muvaffaqiyatli saqlandi va o'quvchilarga eslatma jadvali tuzildi!", reply_markup=get_admin_menu())
 
 @router.message(F.text == "⚙️ Testlarni boshqarish")
 async def manage_tests_admin(message: Message):
@@ -1078,7 +1233,7 @@ async def accept_appeal(callback: CallbackQuery, bot: Bot):
         
         questions_count = await session.scalar(select(func.count(Question.id)).where(Question.test_id == ts.test_id))
         if questions_count > 0:
-            ts.score_percentage = round((ts.score / (questions_count * 3.1)) * 100, 2)
+            ts.score_percentage = round((ts.score / questions_count) * 100, 2)
             
         await session.commit()
         
@@ -1212,6 +1367,34 @@ async def back_to_menu(message: Message, state: FSMContext):
     else:
         await message.answer("Asosiy menyu:", reply_markup=get_main_menu())
 
+# --- REMINDER BACKGROUND TASK ---
+async def reminder_scheduler(bot: Bot):
+    while True:
+        await asyncio.sleep(60) # Har 1 minutda tekshiradi
+        try:
+            now = datetime.utcnow()
+            reminder_target_time = now + timedelta(minutes=15) # Test boshlanishiga 15 minut qolganda eslatish
+            async with async_session() as session:
+                reminders = (await session.execute(
+                    select(Reminder, Test, Student)
+                    .join(Test, Reminder.test_id == Test.id)
+                    .join(Student, Reminder.student_id == Student.id)
+                    .where(Reminder.reminded == False, Test.start_time <= reminder_target_time, Test.start_time > now)
+                )).all()
+                
+                for rem, t, st in reminders:
+                    if st.telegram_id:
+                        try:
+                            await bot.send_message(
+                                chat_id=st.telegram_id,
+                                text=f"🔔 <b>Eslatma!</b>\n\nSiz ro'yxatdan o'tgan <b>{t.subject} ({t.title})</b> testi 15 daqiqadan so'ng ({t.start_time.strftime('%H:%M')}) boshlanadi. Tayyor turing!"
+                            )
+                        except: pass
+                    rem.reminded = True
+                await session.commit()
+        except Exception as e:
+            logging.error(f"Reminder error: {e}")
+
 async def main():
     logging.basicConfig(level=logging.INFO, stream=sys.stdout)
     await init_db()
@@ -1219,7 +1402,11 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
-    logging.info("🚀 DTM Blok Test & Olimpiada Bot ishga tushdi!")
+    
+    # Background reminder taskni ishga tushiramiz
+    asyncio.create_task(reminder_scheduler(bot))
+    
+    logging.info("🚀 Bot ishga tushdi!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
