@@ -282,7 +282,6 @@ class SelfRegState(StatesGroup):
 
 class AdminAddStudent(StatesGroup):
     waiting_for_data = State()
-    waiting_for_excel = State()
 
 class AdminAddTest(StatesGroup):
     waiting_for_title = State()
@@ -328,7 +327,7 @@ async def get_main_menu_keyboard():
 def get_admin_menu():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="➕ ID qo'shish"), KeyboardButton(text="📂 Excel orqali ID'lar")],
+            [KeyboardButton(text="➕ ID qo'shish")],
             [KeyboardButton(text="📂 Test yuklash"), KeyboardButton(text="🧩 Blok test yuklash")],
             [KeyboardButton(text="⚙️ Blok test holati"), KeyboardButton(text="⚙️ Testlarni boshqarish")],
             [KeyboardButton(text="📊 Jonli statistika"), KeyboardButton(text="📥 Excel natijalar")],
@@ -725,20 +724,16 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
                     row = []
             if row: keyboard_buttons.append(row)
             
-            # Faqat javob variantlari ko'rsatiladi.
-            # Oldingi / Keyingi / Testni yakunlash tugmalari olib tashlandi.
             markup = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
             
             sec_title = f"<b>Fan / Bo'lim: {q.section_name}</b>\n" if q.section_name else ""
             text_content = f"{sec_title}<b>Savol {index + 1} / {len(questions)}</b> (Ball: {q.points})\n\n{q.question_text}"
             
-            # Avval savol chiqadi.
             if q.photo_file_id:
                 q_msg = await bot.send_photo(chat_id=user_id, photo=q.photo_file_id, caption=text_content, reply_markup=markup)
             else:
                 q_msg = await bot.send_message(chat_id=user_id, text=text_content, reply_markup=markup)
 
-            # Har bir savol uchun alohida real-time countdown.
             q_start_time = datetime.now(timezone.utc)
             question_seconds = max(1, int(test.question_time_seconds))
             timer_msg = await bot.send_message(
@@ -747,7 +742,6 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
             )
             last_second = question_seconds
 
-            # Eski flag yangi savolga ta'sir qilmasin.
             user_next_question_flags.pop(user_id, None)
 
             while True:
@@ -759,7 +753,6 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
                 if total_elapsed >= total_duration_sec:
                     break
 
-                # Javob tanlangan bo'lsa, darhol keyingi savolga o'tamiz.
                 if user_id in user_next_question_flags:
                     user_next_question_flags.pop(user_id, None)
                     break
@@ -822,27 +815,8 @@ async def save_answer(callback: CallbackQuery, bot: Bot):
         else: session.add(Answer(session_id=session_id, question_id=question_id, selected_option=selected))
         await session.commit()
 
-    # Javob tanlandi — begin_test_session kutmasdan keyingi savolga o'tadi.
     user_next_question_flags[callback.from_user.id] = {"target_index": None}
     await callback.answer(f"Tanlandi: {selected}")
-
-@router.callback_query(F.data.startswith("navigate_"))
-async def navigate_question(callback: CallbackQuery, bot: Bot):
-    parts = callback.data.split("_")
-    user_id = callback.from_user.id
-    target_idx = int(parts[2])
-    user_next_question_flags[user_id] = {"target_index": target_idx}
-    await callback.answer()
-    try: await callback.message.delete()
-    except: pass
-
-@router.callback_query(F.data.startswith("finish_early_"))
-async def finish_early_callback(callback: CallbackQuery, bot: Bot):
-    user_id = callback.from_user.id
-    user_next_question_flags[user_id] = {"target_index": 999999}
-    await callback.answer("Test yakunlanmoqda...")
-    try: await callback.message.delete()
-    except: pass
 
 async def calculate_and_save_results(session, sess: TestSession):
     questions = (await session.execute(select(Question).where(Question.test_id == sess.test_id))).scalars().all()
@@ -958,34 +932,6 @@ async def admin_save_student(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(f"✅ O'quvchi qo'shildi!\nID: <code>{unique_id}</code>", reply_markup=get_admin_menu())
 
-@router.message(F.text == "📂 Excel orqali ID'lar")
-async def admin_excel_students_prompt(message: Message, state: FSMContext):
-    if not await is_admin(message.from_user.id): return
-    await state.set_state(AdminAddStudent.waiting_for_excel)
-    await message.answer("📂 O'quvchilar ro'yxati bor Excel faylni (`.xlsx`) yuboring.")
-
-@router.message(AdminAddStudent.waiting_for_excel, F.document)
-async def admin_process_excel_students(message: Message, state: FSMContext, bot: Bot):
-    if not await is_admin(message.from_user.id): return
-    document = message.document
-    file_info = await bot.get_file(document.file_id)
-    downloaded = await bot.download_file(file_info.file_path)
-    try:
-        df = pd.read_excel(io.BytesIO(downloaded.read()))
-        added_count = 0
-        async with async_session() as session:
-            for _, row in df.iterrows():
-                session.add(Student(
-                    student_id=f"OLM-2026-{''.join(random.choices('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', k=6))}",
-                    first_name=str(row.iloc[0]), last_name=str(row.iloc[1]), age=str(row.iloc[2]), grade=str(row.iloc[3]), school=str(row.iloc[4])
-                ))
-                added_count += 1
-            await session.commit()
-        await state.clear()
-        await message.answer(f"✅ {added_count} ta o'quvchi qo'shildi!", reply_markup=get_admin_menu())
-    except Exception as e:
-        await message.answer(f"❌ Xatolik: {e}")
-
 @router.message(F.text == "📂 Test yuklash")
 async def admin_add_test_start(message: Message, state: FSMContext):
     if not await is_admin(message.from_user.id): return
@@ -996,6 +942,7 @@ async def admin_add_test_start(message: Message, state: FSMContext):
 @router.message(F.text == "🧩 Blok test yuklash")
 async def admin_add_block_test_start(message: Message, state: FSMContext):
     if not await is_admin(message.from_user.id): return
+    # Blok test uchun qat'iy 180 daqiqa o'rnatildi
     await state.update_data(is_block=True, duration_minutes=180)
     await state.set_state(AdminAddTest.waiting_for_title)
     await message.answer("🧩 DTM Blok test sarlavhasini kiriting:")
@@ -1547,7 +1494,6 @@ async def send_broadcast(message: Message, state: FSMContext, bot: Bot):
 
 @router.message(F.text == "⬅️ Bosh menyu")
 async def back_to_menu(message: Message, state: FSMContext):
-    if await state.get_state() == TestProcessState.in_test.state: return
     await state.clear()
     if await is_admin(message.from_user.id):
         await message.answer("Admin menyu:", reply_markup=get_admin_menu())
