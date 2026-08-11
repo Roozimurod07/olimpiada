@@ -873,8 +873,6 @@ async def show_specific_test_rating(callback: CallbackQuery):
             text += f"{medal} {s.first_name} {s.last_name} ({s.grade}) — <b>{ts.score} ball</b> ({ts.score_percentage}%)\n"
         await callback.message.edit_text(text)
 
-# --- ADMIN REYTING VA QIDIRUV QISMI ---
-
 @router.message(F.text == "🏆 Admin reyting")
 async def admin_rating_menu(message: Message):
     if not await is_admin(message.from_user.id): return
@@ -1071,8 +1069,6 @@ async def admin_session_question_analysis(callback: CallbackQuery):
             
         await callback.message.edit_text(text)
         await callback.answer()
-
-# --- QOLGAN BO'LIMLAR ---
 
 @router.message(F.text == "ℹ️ Olimpiada haqida")
 async def about_handler(message: Message, state: FSMContext):
@@ -1732,10 +1728,10 @@ async def reminder_scheduler(bot: Bot):
                             rem.reminded = True
                 await session.commit()
         except Exception as e:
-                    logging.error(f"Reminder error: {e}")
+            logging.error(f"Reminder error: {e}")
 
 async def main():
-    logging.basicConfig(level=loggin_level := logging.INFO, stream=sys.stdout)
+    logging.basicConfig(level=logging.INFO, stream=sys.stdout)
     await init_db()
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
