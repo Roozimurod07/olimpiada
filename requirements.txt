@@ -1,10 +1,10 @@
 aiogram
-gspread
-google-auth
 sqlalchemy
 aiosqlite
 pypdf
 python-docx
 pandas
 openpyxl
-aiohttp
+gspread
+google-auth
+reportlab
