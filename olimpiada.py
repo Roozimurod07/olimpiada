@@ -63,6 +63,11 @@ class Admin(Base):
     telegram_id = Column(Integer, unique=True, nullable=False)
     role = Column(String(50), default="moderator")
 
+class Setting(Base):
+    __tablename__ = "settings"
+    key = Column(String(50), primary_key=True)
+    value = Column(String(50), nullable=False)
+
 class Test(Base):
     __tablename__ = "tests"
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -159,6 +164,13 @@ async def init_db():
     async with engine.begin() as conn:
         await conn.execute(sa_text("PRAGMA foreign_keys = ON;"))
         await conn.run_sync(Base.metadata.create_all)
+        
+    # Blok test sozlamasini boshlang'ich holatda bazaga kiritish (0 - o'chirilgan)
+    async with async_session() as session:
+        setting = await session.get(Setting, "blok_test_status")
+        if not setting:
+            session.add(Setting(key="blok_test_status", value="0"))
+            await session.commit()
 
 async def is_admin(user_id: int) -> bool:
     if user_id in SUPER_ADMIN_IDS:
@@ -166,6 +178,11 @@ async def is_admin(user_id: int) -> bool:
     async with async_session() as session:
         adm = (await session.execute(select(Admin).where(Admin.telegram_id == user_id))).scalar_one_or_none()
         return adm is not None
+
+async def get_blok_test_status() -> str:
+    async with async_session() as session:
+        setting = await session.get(Setting, "blok_test_status")
+        return setting.value if setting else "0"
 
 async def check_subscription(user_id: int, bot: Bot) -> bool:
     try:
@@ -286,26 +303,32 @@ class TestProcessState(StatesGroup):
 
 router = Router()
 
-def get_main_menu():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="📝 Testni boshlash"), KeyboardButton(text="🗂 Blok testlar")],
-            [KeyboardButton(text="👤 Profilim"), KeyboardButton(text="📊 Mening urinishlarim")],
-            [KeyboardButton(text="⚖️ Apellyatsiya"), KeyboardButton(text="🏆 Reyting")],
-            [KeyboardButton(text="ℹ️ Olimpiada haqida")]
-        ],
-        resize_keyboard=True
-    )
+async def get_main_menu_keyboard():
+    keyboard = [
+        [KeyboardButton(text="📝 Testni boshlash")]
+    ]
+    
+    # Blok test yoqilgan bo'lsa menyuga qo'shamiz
+    if await get_blok_test_status() == "1":
+        keyboard.append([KeyboardButton(text="🗂 Blok testlar")])
+        
+    keyboard.extend([
+        [KeyboardButton(text="👤 Profilim"), KeyboardButton(text="📊 Mening urinishlarim")],
+        [KeyboardButton(text="⚖️ Apellyatsiya"), KeyboardButton(text="🏆 Reyting")],
+        [KeyboardButton(text="ℹ️ Olimpiada haqida")]
+    ])
+    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
 def get_admin_menu():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="➕ ID qo'shish"), KeyboardButton(text="📂 Excel orqali ID'lar")],
             [KeyboardButton(text="📂 Test yuklash"), KeyboardButton(text="🧩 Blok test yuklash")],
-            [KeyboardButton(text="⚙️ Testlarni boshqarish"), KeyboardButton(text="📊 Jonli statistika")],
-            [KeyboardButton(text="📥 Excel natijalar"), KeyboardButton(text="⚖️ Apellyatsiyalar")],
-            [KeyboardButton(text="👥 Adminlar"), KeyboardButton(text="📢 Xabar yuborish")],
-            [KeyboardButton(text="🧹 Bazani tozalash"), KeyboardButton(text="⬅️ Bosh menyu")]
+            [KeyboardButton(text="⚙️ Blok test holati"), KeyboardButton(text="⚙️ Testlarni boshqarish")],
+            [KeyboardButton(text="📊 Jonli statistika"), KeyboardButton(text="📥 Excel natijalar")],
+            [KeyboardButton(text="⚖️ Apellyatsiyalar"), KeyboardButton(text="👥 Adminlar")],
+            [KeyboardButton(text="📢 Xabar yuborish"), KeyboardButton(text="🧹 Bazani tozalash")],
+            [KeyboardButton(text="⬅️ Bosh menyu")]
         ],
         resize_keyboard=True
     )
@@ -340,7 +363,8 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot):
             if not student.is_active:
                 await message.answer("❌ Sizning profilingiz administrator tomonidan bloklangan.")
                 return
-            await message.answer(f"Xush kelibsiz, <b>{student.first_name} {student.last_name}</b>!\nSinfingiz: <b>{student.grade or 'Nomaʼlum'}</b>", reply_markup=get_main_menu())
+            main_menu = await get_main_menu_keyboard()
+            await message.answer(f"Xush kelibsiz, <b>{student.first_name} {student.last_name}</b>!\nSinfingiz: <b>{student.grade or 'Nomaʼlum'}</b>", reply_markup=main_menu)
             return
 
     await state.set_state(SelfRegState.waiting_for_fullname)
@@ -359,7 +383,8 @@ async def check_sub_callback(callback: CallbackQuery, state: FSMContext, bot: Bo
         student = result.scalar_one_or_none()
         
         if student:
-            await callback.message.answer(f"Xush kelibsiz, <b>{student.first_name} {student.last_name}</b>!", reply_markup=get_main_menu())
+            main_menu = await get_main_menu_keyboard()
+            await callback.message.answer(f"Xush kelibsiz, <b>{student.first_name} {student.last_name}</b>!", reply_markup=main_menu)
             return
 
     await state.set_state(SelfRegState.waiting_for_fullname)
@@ -406,7 +431,8 @@ async def process_self_school(message: Message, state: FSMContext):
         await session.commit()
         
     await state.clear()
-    await message.answer(f"✅ Muvaffaqiyatli ro'yxatdan o'tdingiz!\nID raqamingiz: <code>{unique_id}</code>", reply_markup=get_main_menu())
+    main_menu = await get_main_menu_keyboard()
+    await message.answer(f"✅ Muvaffaqiyatli ro'yxatdan o'tdingiz!\nID raqamingiz: <code>{unique_id}</code>", reply_markup=main_menu)
 
 @router.message(F.text == "👤 Profilim")
 async def profile_handler(message: Message, state: FSMContext):
@@ -559,12 +585,12 @@ async def process_appeal_text(message: Message, state: FSMContext):
         await session.commit()
     
     await state.clear()
-    await message.answer("✅ Apellyatsiyangiz adminga yuborildi. Tez orada ko'rib chiqiladi!", reply_markup=get_main_menu())
+    main_menu = await get_main_menu_keyboard()
+    await message.answer("✅ Apellyatsiyangiz adminga yuborildi. Tez orada ko'rib chiqiladi!", reply_markup=main_menu)
 
-@router.message(F.text.in_(["📝 Testni boshlash", "🗂 Blok testlar"]))
+@router.message(F.text == "📝 Testni boshlash")
 async def start_test_prompt(message: Message, state: FSMContext):
     if await state.get_state() == TestProcessState.in_test.state: return
-    is_block = (message.text == "🗂 Blok testlar")
     async with async_session() as session:
         student = (await session.execute(select(Student).where(Student.telegram_id == message.from_user.id))).scalar_one_or_none()
         if not student or not student.grade:
@@ -576,18 +602,48 @@ async def start_test_prompt(message: Message, state: FSMContext):
                 Test.is_active == True, 
                 Test.is_finished == False, 
                 Test.grade_level == student.grade,
-                Test.is_block_test == is_block
+                Test.is_block_test == False
             )
         )).scalars().all()
         
         if not tests:
-            title_type = "blok testlar" if is_block else "oddiy testlar"
-            await message.answer(f"⚠️ Hozirda <b>{student.grade}</b> uchun faol {title_type} mavjud emas.")
+            await message.answer(f"⚠️ Hozirda <b>{student.grade}</b> uchun faol oddiy testlar mavjud emas.")
             return
 
         keyboard_buttons = [[InlineKeyboardButton(text=f"📚 {t.subject} — {t.title}", callback_data=f"start_test_{t.id}")] for t in tests]
-        menu_title = "🗂 <b>Mavjud blok testlar:</b>" if is_block else "📝 <b>Mavjud testlar:</b>"
-        await message.answer(f"{menu_title}\n\nTestni tanlang:", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_buttons))
+        await message.answer("📝 <b>Mavjud testlar:</b>\n\nTestni tanlang:", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_buttons))
+
+@router.message(F.text == "🗂 Blok testlar")
+async def start_block_test_prompt(message: Message, state: FSMContext):
+    if await state.get_state() == TestProcessState.in_test.state: return
+    
+    # Blok test yoniq ekanligini tekshiramiz
+    if await get_blok_test_status() != "1":
+        await message.answer("⚠️ Hozirda blok test bo'limi yopiq.")
+        return
+
+    async with async_session() as session:
+        student = (await session.execute(select(Student).where(Student.telegram_id == message.from_user.id))).scalar_one_or_none()
+        if not student or not student.grade:
+            await message.answer("❌ Profilingizda sinf ko'rsatilmagan yoki ro'yxatdan o'tmagansiz.")
+            return
+
+        # Sinf tanlash bosqichisiz to'g'ridan-to'g'ri o'quvchining sinfiga mos blok testlarni chiqaramiz
+        tests = (await session.execute(
+            select(Test).where(
+                Test.is_active == True, 
+                Test.is_finished == False, 
+                Test.grade_level == student.grade,
+                Test.is_block_test == True
+            )
+        )).scalars().all()
+        
+        if not tests:
+            await message.answer(f"⚠️ Hozirda <b>{student.grade}</b> uchun faol blok testlar mavjud emas.")
+            return
+
+        keyboard_buttons = [[InlineKeyboardButton(text=f"🧩 {t.subject} — {t.title}", callback_data=f"start_test_{t.id}")] for t in tests]
+        await message.answer("🗂 <b>Mavjud blok testlar:</b>\n\nTestni tanlang:", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_buttons))
 
 @router.callback_query(F.data.startswith("start_test_"))
 async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bot):
@@ -681,14 +737,11 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
             else:
                 q_msg = await bot.send_message(chat_id=user_id, text=text_content, reply_markup=markup)
             
-            # Global taymer bilan kutish (foydalanuvchi javob berguncha yoki keyingi/oldingiga o'tguncha)
-            # Har sekundda tekshirib turamiz
             while True:
                 await asyncio.sleep(1)
                 now_el = (datetime.utcnow() - start_timestamp).total_seconds()
                 if now_el >= total_duration_sec:
                     break
-                # Agar state o'zgargan bo'lsa yoki savol almashgan bo'lsa chiqib ketadi
                 if user_id not in user_next_question_flags or user_next_question_flags[user_id].get("target_index") != index:
                     break
             
@@ -712,7 +765,8 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
                     save_result_to_sheet(student_obj.student_id, f"{student_obj.first_name} {student_obj.last_name}", student_obj.age or "-", student_obj.school or "-", student_obj.grade or "-", test_obj.title, test_obj.subject, sess.score, sess.score_percentage, sess.correct_answers, sess.wrong_answers)
                 
                 await state.clear()
-                await bot.send_message(chat_id=user_id, text=f"🏆 <b>TEST YAKUNLANDI!</b>\n\nNatijangiz: {sess.score} ball ({sess.score_percentage}%).", reply_markup=get_main_menu())
+                main_menu = await get_main_menu_keyboard()
+                await bot.send_message(chat_id=user_id, text=f"🏆 <b>TEST YAKUNLANDI!</b>\n\nNatijangiz: {sess.score} ball ({sess.score_percentage}%).", reply_markup=main_menu)
 
 user_next_question_flags = {}
 
@@ -807,6 +861,37 @@ async def admin_panel(message: Message, state: FSMContext):
     if not await is_admin(message.from_user.id): return
     await state.clear()
     await message.answer("🛠 <b>Admin Panel</b>", reply_markup=get_admin_menu())
+
+@router.message(F.text == "⚙️ Blok test holati")
+async def admin_blok_test_settings(message: Message):
+    if not await is_admin(message.from_user.id): return
+    status = await get_blok_test_status()
+    status_text = "🟢 Yoqilgan" if status == "1" else "🔴 O'chirilgan"
+    
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🟢 Yoqish", callback_data="set_blok_1"),
+            InlineKeyboardButton(text="🔴 O'chirish", callback_data="set_blok_0")
+        ]
+    ])
+    await message.answer(f"⚙️ Blok test bo'limi hozirgi holati: <b>{status_text}</b>\n\nO'zgartirish uchun tugmani bosing:", reply_markup=markup)
+
+@router.callback_query(F.data.in_(["set_blok_1", "set_blok_0"]))
+async def update_blok_test_status(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id): return
+    new_val = "1" if callback.data == "set_blok_1" else "0"
+    
+    async with async_session() as session:
+        setting = await session.get(Setting, "blok_test_status")
+        if setting:
+            setting.value = new_val
+        else:
+            session.add(Setting(key="blok_test_status", value=new_val))
+        await session.commit()
+        
+    status_text = "🟢 Yoqildi (o'quvchilarga ko'rinadi)" if new_val == "1" else "🔴 O'chirildi (o'quvchilardan yashirildi)"
+    await callback.message.edit_text(f"✅ Blok test holati muvaffaqiyatli o'zgartirildi: <b>{status_text}</b>")
+    await callback.answer()
 
 @router.message(F.text == "➕ ID qo'shish")
 async def admin_add_student_prompt(message: Message, state: FSMContext):
@@ -951,7 +1036,6 @@ async def admin_handle_photo_question(message: Message, state: FSMContext):
     data = await state.get_data()
     q_list = data.get("questions", [])
     
-    # Rasmli savolni qo'shamiz
     parsed = parse_single_question_text(caption)
     if parsed:
         parsed["photo_file_id"] = photo_id
@@ -1120,7 +1204,6 @@ async def admin_save_answers_and_test(message: Message, state: FSMContext):
                 points=points
             ))
             
-        # Eslatmalarni tayyorlash
         if data.get("start_time"):
             students = (await session.execute(select(Student).where(Student.grade == data["grade"], Student.telegram_id.is_not(None)))).scalars().all()
             for st in students:
@@ -1365,15 +1448,15 @@ async def back_to_menu(message: Message, state: FSMContext):
     if await is_admin(message.from_user.id):
         await message.answer("Admin menyu:", reply_markup=get_admin_menu())
     else:
-        await message.answer("Asosiy menyu:", reply_markup=get_main_menu())
+        main_menu = await get_main_menu_keyboard()
+        await message.answer("Asosiy menyu:", reply_markup=main_menu)
 
-# --- REMINDER BACKGROUND TASK ---
 async def reminder_scheduler(bot: Bot):
     while True:
-        await asyncio.sleep(60) # Har 1 minutda tekshiradi
+        await asyncio.sleep(60)
         try:
             now = datetime.utcnow()
-            reminder_target_time = now + timedelta(minutes=15) # Test boshlanishiga 15 minut qolganda eslatish
+            reminder_target_time = now + timedelta(minutes=15)
             async with async_session() as session:
                 reminders = (await session.execute(
                     select(Reminder, Test, Student)
@@ -1403,7 +1486,6 @@ async def main():
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
     
-    # Background reminder taskni ishga tushiramiz
     asyncio.create_task(reminder_scheduler(bot))
     
     logging.info("🚀 Bot ishga tushdi!")
