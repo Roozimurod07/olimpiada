@@ -1,4 +1,4 @@
-import asyncio
+[cite: 2]import asyncio
 import logging
 import sys
 import random
@@ -164,6 +164,16 @@ async def init_db():
     async with engine.begin() as conn:
         await conn.execute(sa_text("PRAGMA foreign_keys = ON;"))
         await conn.run_sync(Base.metadata.create_all)
+        
+        # Avtomatik ravishda tests jadvaliga question_time_seconds ustuni borligini tekshirish va qo'shish
+        try:
+            await conn.execute(sa_text("SELECT question_time_seconds FROM tests LIMIT 1"))
+        except Exception:
+            try:
+                await conn.execute(sa_text("ALTER TABLE tests ADD COLUMN question_time_seconds INTEGER DEFAULT 60;"))
+                print("Muvaffaqiyatli: 'question_time_seconds' ustuni bazaga avtomatik qo'shildi!")
+            except Exception as e:
+                print(f"Ustun qo'shishda xatolik: {e}")
         
     async with async_session() as session:
         setting = await session.get(Setting, "blok_test_status")
