@@ -695,7 +695,12 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
         await session.commit()
         await session.refresh(test_session)
 
-        await callback.message.edit_text(f"🚀 <b>{test.subject} ({test.title})</b> testi boshlandi!\n⏱ Har bir savolga: {test.question_time_seconds} soniya.\n⏱ Umumiy vaqt: {test.duration_minutes} daqiqa.")
+        # Test boshlanganligi haqida faqat qisqa xabar.
+        # Umumiy "60 daqiqa" ko'rsatilmaydi — timer har bir savolda alohida ko'rsatiladi.
+        await callback.message.edit_text(
+            f"🚀 <b>{test.subject} ({test.title})</b> testi boshlandi!\n"
+            f"⏱ Har bir savolga: {test.question_time_seconds} soniya."
+        )
         user_id = callback.from_user.id
         await state.set_state(TestProcessState.in_test)
         
@@ -729,30 +734,53 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
             # Javob tanlanganda save_answer handler keyingi savolga o'tishni ishga tushiradi.
             markup = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
             
-            sec_title = f"<b>Fan / Bo'lim: {q.section_name}</b>\n" if q.section_name else ""
-            text_content = f"{sec_title}<b>Savol {index + 1} / {len(questions)}</b> (Ball: {q.points})\n\n{q.question_text}"
-            
-            if q.photo_file_id:
-                q_msg = await bot.send_photo(chat_id=user_id, photo=q.photo_file_id, caption=text_content, reply_markup=markup)
-            else:
-                q_msg = await bot.send_message(chat_id=user_id, text=text_content, reply_markup=markup)
-            
             q_start_time = datetime.now(timezone.utc)
+
+            # Alohida timer xabari: har soniyada 15 -> 14 -> 13 ... ko'rinadi.
+            initial_seconds = max(1, int(test.question_time_seconds))
+            timer_msg = await bot.send_message(
+                chat_id=user_id,
+                text=f"⏳ <b>Qolgan vaqt: {initial_seconds} soniya</b>"
+            )
+            last_shown_second = initial_seconds
+
             while True:
-                await asyncio.sleep(1)
-                now_el = (datetime.now(timezone.utc) - start_timestamp).total_seconds()
-                if now_el >= total_duration_sec:
+                await asyncio.sleep(0.2)
+
+                now = datetime.now(timezone.utc)
+                total_elapsed = (now - start_timestamp).total_seconds()
+                q_elapsed = (now - q_start_time).total_seconds()
+
+                if total_elapsed >= total_duration_sec:
                     break
-                q_elapsed = (datetime.now(timezone.utc) - q_start_time).total_seconds()
-                if q_elapsed >= test.question_time_seconds:
-                    break
+
+                # O'quvchi javob tanlagan bo'lsa, vaqt tugashini kutmaydi.
                 if user_id in user_next_question_flags:
                     flag = user_next_question_flags.pop(user_id)
-                    if flag.get("target_index") is None:
+                    if flag.get("target_index") is None or flag.get("target_index") != index:
                         break
-                    if flag.get("target_index") != index:
+
+                remaining = test.question_time_seconds - q_elapsed
+                seconds_left = max(0, int(remaining + 0.999))
+
+                if seconds_left != last_shown_second:
+                    last_shown_second = seconds_left
+                    if seconds_left <= 0:
                         break
-            
+                    try:
+                        await bot.edit_message_text(
+                            chat_id=user_id,
+                            message_id=timer_msg.message_id,
+                            text=f"⏳ <b>Qolgan vaqt: {seconds_left} soniya</b>"
+                        )
+                    except Exception:
+                        pass
+
+            try:
+                await bot.delete_message(chat_id=user_id, message_id=timer_msg.message_id)
+            except Exception:
+                pass
+
             try: await bot.delete_message(chat_id=user_id, message_id=q_msg.message_id)
             except Exception: pass
             
