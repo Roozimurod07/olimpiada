@@ -82,9 +82,9 @@ class Test(Base):
     grade_level = Column(String(20), nullable=False)
     max_attempts = Column(Integer, default=1)
     mode = Column(String(20), default="question_timer")
-    question_time_seconds = Column(Integer, default=15) # Har bir savol uchun vaqt (soniyada)
+    question_time_seconds = Column(Integer, default=15)
     is_block_test = Column(Boolean, default=False)
-    block_subjects = Column(Text, nullable=True) # JSON formatida asosiy fanlar
+    block_subjects = Column(Text, nullable=True)
     start_time = Column(DateTime, nullable=True)
     end_time = Column(DateTime, nullable=True)
     is_active = Column(Boolean, default=True)
@@ -97,7 +97,7 @@ class Question(Base):
     __tablename__ = "questions"
     id = Column(Integer, primary_key=True, autoincrement=True)
     test_id = Column(Integer, ForeignKey("tests.id", ondelete="CASCADE"), nullable=False)
-    section_name = Column(String(100), nullable=True) # Fan nomi (Tarix, Ona tili, Matematika, 1-asosiy, 2-asosiy)
+    section_name = Column(String(100), nullable=True)
     question_text = Column(Text, nullable=False)
     photo_file_id = Column(String(200), nullable=True)
     option_a = Column(Text, nullable=False)
@@ -443,7 +443,6 @@ async def process_self_school(message: Message, state: FSMContext):
 
 @router.message(F.text == "👤 Profilim")
 async def profile_handler(message: Message, state: FSMContext):
-    if await state.get_state() == TestProcessState.in_test.state: return
     async with async_session() as session:
         student = (await session.execute(select(Student).where(Student.telegram_id == message.from_user.id))).scalar_one_or_none()
         if not student:
@@ -453,7 +452,6 @@ async def profile_handler(message: Message, state: FSMContext):
 
 @router.message(F.text == "📊 Mening urinishlarim")
 async def my_attempts_handler(message: Message, state: FSMContext):
-    if await state.get_state() == TestProcessState.in_test.state: return
     async with async_session() as session:
         student = (await session.execute(select(Student).where(Student.telegram_id == message.from_user.id))).scalar_one_or_none()
         if not student:
@@ -481,7 +479,6 @@ async def my_attempts_handler(message: Message, state: FSMContext):
 
 @router.message(F.text == "⚖️ Apellyatsiya")
 async def student_appeal_menu(message: Message, state: FSMContext):
-    if await state.get_state() == TestProcessState.in_test.state: return
     async with async_session() as session:
         student = (await session.execute(select(Student).where(Student.telegram_id == message.from_user.id))).scalar_one_or_none()
         if not student:
@@ -597,7 +594,6 @@ async def process_appeal_text(message: Message, state: FSMContext):
 
 @router.message(F.text == "📝 Testni boshlash")
 async def start_test_prompt(message: Message, state: FSMContext):
-    if await state.get_state() == TestProcessState.in_test.state: return
     async with async_session() as session:
         student = (await session.execute(select(Student).where(Student.telegram_id == message.from_user.id))).scalar_one_or_none()
         if not student or not student.grade:
@@ -622,8 +618,6 @@ async def start_test_prompt(message: Message, state: FSMContext):
 
 @router.message(F.text == "🗂 Blok testlar")
 async def start_block_test_prompt(message: Message, state: FSMContext):
-    if await state.get_state() == TestProcessState.in_test.state: return
-    
     if await get_blok_test_status() != "1":
         await message.answer("⚠️ Hozirda blok test bo'limi yopiq.")
         return
@@ -692,7 +686,7 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
         await session.commit()
         await session.refresh(test_session)
 
-        await callback.message.edit_text(f"🚀 <b>{test.subject} ({test.title})</b> testi boshlandi!\n⏱ Test uchun berilgan umumiy vaqt: {test.question_time_seconds // 60} daqiqa.")
+        await callback.message.edit_text(f"🚀 <b>{test.subject} ({test.title})</b> testi boshlandi!\n⏱ Test uchun berilgan vaqt: {test.question_time_seconds // 60} daqiqa.")
         user_id = callback.from_user.id
         await state.set_state(TestProcessState.in_test)
         
@@ -801,7 +795,6 @@ async def calculate_and_save_results(session, sess: TestSession):
 
 @router.message(F.text == "🏆 Reyting")
 async def rating_menu_prompt(message: Message, state: FSMContext):
-    if await state.get_state() == TestProcessState.in_test.state: return
     async with async_session() as session:
         tests = (await session.execute(select(Test))).scalars().all()
         if not tests:
@@ -833,7 +826,6 @@ async def show_specific_test_rating(callback: CallbackQuery):
 
 @router.message(F.text == "ℹ️ Olimpiada haqida")
 async def about_handler(message: Message, state: FSMContext):
-    if await state.get_state() == TestProcessState.in_test.state: return
     await message.answer("ℹ️ Professional Olimpiada Tizimi v3.1 — Blok testlar uchun 180 daqiqa vaqt va UZT vaqt nazorati bilan.")
 
 @router.message(Command("admin"))
@@ -931,7 +923,7 @@ async def admin_add_test_start(message: Message, state: FSMContext):
 @router.message(F.text == "🧩 Blok test yuklash")
 async def admin_add_block_test_start(message: Message, state: FSMContext):
     if not await is_admin(message.from_user.id): return
-    await state.update_data(is_block=True, question_time_seconds=10800) # 180 daqiqa = 10800 soniya
+    await state.update_data(is_block=True, question_time_seconds=10800)
     await state.set_state(AdminAddTest.waiting_for_title)
     await message.answer("🧩 DTM Blok test sarlavhasini kiriting (Bu test uchun avtomatik ravishda 180 daqiqa belgilanadi):")
 
@@ -972,7 +964,6 @@ async def admin_get_block_sub1(message: Message, state: FSMContext):
 @router.message(AdminAddTest.waiting_for_block_sub2)
 async def admin_get_block_sub2(message: Message, state: FSMContext):
     await state.update_data(block_sub2=message.text.strip())
-    # Blok test uchun savol vaqtini so'ramaymiz, chunki u 180 daqiqaga qat'iy belgilandi
     await state.update_data(max_attempts=1)
     await state.set_state(AdminAddTest.waiting_for_start_time)
     await message.answer("Test boshlanish vaqtini kiriting (Format: `YYYY-MM-DD HH:MM` O'zbekiston vaqti bilan, masalan: `2026-06-01 10:00` yoki `-`):")
@@ -1000,7 +991,6 @@ async def admin_get_start_time(message: Message, state: FSMContext):
     start_dt = None
     if txt != "-":
         try:
-            # Kiritilgan vaqtni UZT (UTC+5) sifatida qabul qilish
             naive_dt = datetime.strptime(txt, "%Y-%m-%d %H:%M")
             start_dt = naive_dt.replace(tzinfo=UZT)
         except:
@@ -1433,7 +1423,6 @@ async def send_broadcast(message: Message, state: FSMContext, bot: Bot):
 
 @router.message(F.text == "⬅️ Bosh menyu")
 async def back_to_menu(message: Message, state: FSMContext):
-    if await state.get_state() == TestProcessState.in_test.state: return
     await state.clear()
     if await is_admin(message.from_user.id):
         await message.answer("Admin menyu:", reply_markup=get_admin_menu())
