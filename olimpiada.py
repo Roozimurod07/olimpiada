@@ -36,6 +36,7 @@ from google.oauth2.service_account import Credentials
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON")
 SHEET_NAME = "Olimpiada"
+REQUIRED_CHANNEL = "@yetakchi_kabeniti"
 
 SUPER_ADMIN_IDS = [8317043750]
 
@@ -47,6 +48,7 @@ class Student(Base):
     student_id = Column(String(50), unique=True, index=True, nullable=False)
     first_name = Column(String(100), nullable=False)
     last_name = Column(String(100), nullable=False)
+    age = Column(String(20), nullable=True)
     school = Column(String(150), nullable=True)
     grade = Column(String(20), nullable=True)
     telegram_id = Column(Integer, unique=True, nullable=True)
@@ -74,7 +76,7 @@ class Test(Base):
     start_time = Column(DateTime, nullable=True)
     end_time = Column(DateTime, nullable=True)
     is_active = Column(Boolean, default=True)
-    is_finished = Column(Boolean, default=False) # Admin tomonidan test yakunlanganligi
+    is_finished = Column(Boolean, default=False)
     
     questions = relationship("Question", back_populates="test", cascade="all, delete-orphan")
     test_sessions = relationship("TestSession", back_populates="test", cascade="all, delete-orphan")
@@ -156,6 +158,16 @@ async def is_admin(user_id: int) -> bool:
         adm = (await session.execute(select(Admin).where(Admin.telegram_id == user_id))).scalar_one_or_none()
         return adm is not None
 
+# --- KANALGA OBUNANI TEKSHIRISH ---
+async def check_subscription(user_id: int, bot: Bot) -> bool:
+    try:
+        member = await bot.get_chat_member(chat_id=REQUIRED_CHANNEL, user_id=user_id)
+        if member.status in ["member", "administrator", "creator"]:
+            return True
+    except Exception:
+        pass
+    return False
+
 # --- GOOGLE SHEETS BILAN ISHLASH ---
 def get_gspread_sheet():
     scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
@@ -167,11 +179,11 @@ def get_gspread_sheet():
     client = gspread.authorize(creds)
     return client.open(SHEET_NAME).sheet1
 
-def save_result_to_sheet(student_id, full_name, school, grade, test_title, subject, score, percentage, correct, wrong):
+def save_result_to_sheet(student_id, full_name, age, school, grade, test_title, subject, score, percentage, correct, wrong):
     try:
         sheet = get_gspread_sheet()
         row_data = [
-            str(student_id), str(full_name), str(school), str(grade),
+            str(student_id), str(full_name), str(age), str(school), str(grade),
             str(subject), str(test_title), str(score), f"{percentage}%",
             str(correct), str(wrong), datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         ]
@@ -184,11 +196,11 @@ def update_result_in_sheet(student_id, test_title, score, percentage, correct):
         sheet = get_gspread_sheet()
         records = sheet.get_all_records()
         for idx, row in enumerate(records, start=2):
-            # ID va Test nomini to'g'ri solishtirish uchun stringga o'tkazamiz
             if str(row.get("ID")) == str(student_id) and str(row.get("Test")) == str(test_title):
-                sheet.update_cell(idx, 7, str(score))          # Ball ustuni (7-ustun)
-                sheet.update_cell(idx, 8, f"{percentage}%")    # Foiz ustuni (8-ustun)
-                sheet.update_cell(idx, 9, str(correct))        # To'g'ri javoblar ustuni (9-ustun)
+                # Ustunlar tartibi: 8-Ball, 9-Foiz, 10-To'g'ri javoblar
+                sheet.update_cell(idx, 8, str(score))
+                sheet.update_cell(idx, 9, f"{percentage}%")
+                sheet.update_cell(idx, 10, str(correct))
                 break
     except Exception as e:
         print(f"❌ Google Sheets yangilash xatosi: {e}")
@@ -232,8 +244,12 @@ def generate_certificate_pdf(student_name, test_title, subject, score_pct):
     pdf_buffer.seek(0)
     return pdf_buffer.read()
 
-class RegState(StatesGroup):
-    waiting_for_id = State()
+# --- STATES ---
+class SelfRegState(StatesGroup):
+    waiting_for_fullname = State()
+    waiting_for_age = State()
+    waiting_for_grade = State()
+    waiting_for_school = State()
 
 class AdminAddStudent(StatesGroup):
     waiting_for_data = State()
@@ -293,10 +309,20 @@ def get_finish_test_keyboard():
     )
 
 @router.message(Command("start"))
-async def cmd_start(message: Message, state: FSMContext):
+async def cmd_start(message: Message, state: FSMContext, bot: Bot):
     await state.clear()
     if await is_admin(message.from_user.id):
         await message.answer("🛠 <b>Xush kelibsiz, Admin!</b>", reply_markup=get_admin_menu())
+        return
+
+    # Obunani tekshirish
+    is_subscribed = await check_subscription(message.from_user.id, bot)
+    if not is_subscribed:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📢 Kanalga obuna bo'lish", url=f"https://t.me/{REQUIRED_CHANNEL.replace('@', '')}")],
+            [InlineKeyboardButton(text="✅ Obunani tekshirish", callback_data="check_sub")]
+        ])
+        await message.answer(f"⚠️ Botdan foydalanish uchun avval quyidagi kanalga obuna bo'lishingiz kerak:\n\n{REQUIRED_CHANNEL}", reply_markup=keyboard)
         return
 
     async with async_session() as session:
@@ -310,28 +336,72 @@ async def cmd_start(message: Message, state: FSMContext):
             await message.answer(f"Xush kelibsiz, <b>{student.first_name} {student.last_name}</b>!\nSinfingiz: <b>{student.grade or 'Nomaʼlum'}</b>", reply_markup=get_main_menu())
             return
 
-    await state.set_state(RegState.waiting_for_id)
-    await message.answer("🎓 <b>Olimpiada tizimiga xush kelibsiz!</b>\n\nIltimos, ID raqamingizni kiriting:")
+    # O'quvchi bazada bo'lmasa, o'zi ro'yxatdan o'tishni boshlaydi
+    await state.set_state(SelfRegState.waiting_for_fullname)
+    await message.answer("🎓 <b>Olimpiada tizimiga xush kelibsiz!</b>\n\nIltimos, to'liq <b>Ism va Familiyangizni</b> kiriting:")
 
-@router.message(RegState.waiting_for_id)
-async def process_student_id(message: Message, state: FSMContext):
-    entered_id = message.text.strip()
+@router.callback_query(F.data == "check_sub")
+async def check_sub_callback(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    is_subscribed = await check_subscription(callback.from_user.id, bot)
+    if not is_subscribed:
+        await callback.answer("❌ Hali kanalga obuna bo'lmagansiz!", show_alert=True)
+        return
+    
+    await callback.message.delete()
     async with async_session() as session:
-        result = await session.execute(select(Student).where(Student.student_id == entered_id))
+        result = await session.execute(select(Student).where(Student.telegram_id == callback.from_user.id))
         student = result.scalar_one_or_none()
         
-        if not student:
-            await message.answer("❌ ID raqami topilmadi. Qayta kiriting:")
+        if student:
+            await callback.message.answer(f"Xush kelibsiz, <b>{student.first_name} {student.last_name}</b>!", reply_markup=get_main_menu())
             return
-        if student.telegram_id is not None and student.telegram_id != message.from_user.id:
-            await message.answer("⚠️ Bu ID boshqa akkauntga ulangan.")
-            return
-        
-        await session.execute(update(Student).where(Student.id == student.id).values(telegram_id=message.from_user.id))
+
+    await state.set_state(SelfRegState.waiting_for_fullname)
+    await callback.message.answer("🎓 Muvaffaqiyatli obuna bo'ldingiz!\n\nIltimos, to'liq <b>Ism va Familiyangizni</b> kiriting:")
+
+# --- O'QUVCHILARNING O'ZI RO'YXATDAN O'TISH JARAYONI ---
+@router.message(SelfRegState.waiting_for_fullname)
+async def process_self_fullname(message: Message, state: FSMContext):
+    await state.update_data(fullname=message.text.strip())
+    await state.set_state(SelfRegState.waiting_for_age)
+    await message.answer("Rahmat! Endi yoshingizni kiriting (masalan: 16):")
+
+@router.message(SelfRegState.waiting_for_age)
+async def process_self_age(message: Message, state: FSMContext):
+    await state.update_data(age=message.text.strip())
+    await state.set_state(SelfRegState.waiting_for_grade)
+    await message.answer("Sinfingizni kiriting (masalan: 11-sinf):")
+
+@router.message(SelfRegState.waiting_for_grade)
+async def process_self_grade(message: Message, state: FSMContext):
+    await state.update_data(grade=message.text.strip())
+    await state.set_state(SelfRegState.waiting_for_school)
+    await message.answer("Maktabingiz raqami yoki nomini kiriting:")
+
+@router.message(SelfRegState.waiting_for_school)
+async def process_self_school(message: Message, state: FSMContext):
+    data = await state.get_data()
+    fullname_parts = data["fullname"].split(" ", 1)
+    first_name = fullname_parts[0]
+    last_name = fullname_parts[1] if len(fullname_parts) > 1 else "-"
+    
+    unique_id = f"OLM-2026-{''.join(random.choices('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', k=6))}"
+    
+    async with async_session() as session:
+        student = Student(
+            student_id=unique_id,
+            first_name=first_name,
+            last_name=last_name,
+            age=data["age"],
+            grade=data["grade"],
+            school=message.text.strip(),
+            telegram_id=message.from_user.id
+        )
+        session.add(student)
         await session.commit()
         
     await state.clear()
-    await message.answer(f"✅ Muvaffaqiyatli ro'yxatdan o'tdingiz, {student.first_name}!\nSinfingiz: <b>{student.grade or '-'}</b>", reply_markup=get_main_menu())
+    await message.answer(f"✅ Muvaffaqiyatli ro'yxatdan o'tdingiz!\nID raqamingiz: <code>{unique_id}</code>", reply_markup=get_main_menu())
 
 @router.message(F.text == "👤 Profilim")
 async def profile_handler(message: Message, state: FSMContext):
@@ -341,7 +411,7 @@ async def profile_handler(message: Message, state: FSMContext):
         if not student:
             await message.answer("Siz ro'yxatdan o'tmagansiz. /start ni bosing.")
             return
-        await message.answer(f"👤 <b>Profil:</b>\n\nID: <code>{student.student_id}</code>\nIsm: {student.first_name} {student.last_name}\nMaktab: {student.school or '-'}\nSinf: {student.grade or '-'}")
+        await message.answer(f"👤 <b>Profil:</b>\n\nID: <code>{student.student_id}</code>\nIsm: {student.first_name} {student.last_name}\nYosh: {student.age or '-'}\nMaktab: {student.school or '-'}\nSinf: {student.grade or '-'}")
 
 @router.message(F.text == "📊 Mening urinishlarim")
 async def my_attempts_handler(message: Message, state: FSMContext):
@@ -381,7 +451,6 @@ async def student_appeal_menu(message: Message, state: FSMContext):
             await message.answer("Ro'yxatdan o'tmagansiz.")
             return
         
-        # Faqat admin yakunlagan (is_finished=True) testlar bo'yicha tahlil va apellyatsiya ko'rsatiladi
         sessions = (await session.execute(
             select(TestSession, Test)
             .join(Test, TestSession.test_id == Test.id)
@@ -438,7 +507,7 @@ async def show_test_analysis_for_appeal(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("get_cert_"))
 async def download_certificate(callback: CallbackQuery, bot: Bot):
-    session_id = int(callback.data.split("_")[3]) # updated index due to split
+    session_id = int(callback.data.split("_")[3])
     async with async_session() as session:
         ts = await session.get(TestSession, session_id)
         test = await session.get(Test, ts.test_id)
@@ -498,7 +567,6 @@ async def start_test_prompt(message: Message, state: FSMContext):
             await message.answer("❌ Profilingizda sinf ko'rsatilmagan yoki ro'yxatdan o'tmagansiz.")
             return
 
-        # Faqat aktiv va admin yakunlamagan testlar ko'rsatiladi
         tests = (await session.execute(
             select(Test).where(Test.is_active == True, Test.is_finished == False, Test.grade_level == student.grade)
         )).scalars().all()
@@ -559,7 +627,6 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
         await state.set_state(TestProcessState.in_test)
         
         for index, q in enumerate(questions):
-            # Test davomida admin testni to'xtatgan bo'lsa, testni to'xtatamiz
             current_test_check = await session.get(Test, test_id)
             if not current_test_check.is_active or current_test_check.is_finished:
                 break
@@ -612,7 +679,7 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
                 student_obj = await final_session.get(Student, sess.student_id)
                 test_obj = await final_session.get(Test, sess.test_id)
                 if student_obj and test_obj:
-                    save_result_to_sheet(student_obj.student_id, f"{student_obj.first_name} {student_obj.last_name}", student_obj.school or "-", student_obj.grade or "-", test_obj.title, test_obj.subject, sess.score, sess.score_percentage, sess.correct_answers, sess.wrong_answers)
+                    save_result_to_sheet(student_obj.student_id, f"{student_obj.first_name} {student_obj.last_name}", student_obj.age or "-", student_obj.school or "-", student_obj.grade or "-", test_obj.title, test_obj.subject, sess.score, sess.score_percentage, sess.correct_answers, sess.wrong_answers)
                 
                 await state.clear()
                 await bot.send_message(chat_id=user_id, text=f"🏆 <b>TEST YAKUNLANDI!</b>\n\nNatijangiz saqlandi. Admin testni yakunlagach, batafsil tahlil va apellyatsiya bo'limi ochiladi.", reply_markup=get_main_menu())
@@ -693,7 +760,7 @@ async def show_specific_test_rating(callback: CallbackQuery):
 @router.message(F.text == "ℹ️ Olimpiada haqida")
 async def about_handler(message: Message, state: FSMContext):
     if await state.get_state() == TestProcessState.in_test.state: return
-    await message.answer("ℹ️ Professional Olimpiada Tizimi v2.1 — Xavfsizlik va Google Sheets sinxronizatsiyasi bilan.")
+    await message.answer("ℹ️ Professional Olimpiada Tizimi v2.2 — Majburiy obuna va mustaqil ro'yxatdan o'tish bilan.")
 
 @router.message(Command("admin"))
 async def admin_panel(message: Message, state: FSMContext):
@@ -705,18 +772,18 @@ async def admin_panel(message: Message, state: FSMContext):
 async def admin_add_student_prompt(message: Message, state: FSMContext):
     if not await is_admin(message.from_user.id): return
     await state.set_state(AdminAddStudent.waiting_for_data)
-    await message.answer("📝 Ma'lumotlarni yuboring:\n<code>Ism, Familiya, Sinf, Maktab</code>")
+    await message.answer("📝 Ma'lumotlarni yuboring:\n<code>Ism, Familiya, Yosh, Sinf, Maktab</code>")
 
 @router.message(AdminAddStudent.waiting_for_data)
 async def admin_save_student(message: Message, state: FSMContext):
     if not await is_admin(message.from_user.id): return
     parts = [p.strip() for p in message.text.split(",")]
-    if len(parts) < 4:
-        await message.answer("❌ Format xato!")
+    if len(parts) < 5:
+        await message.answer("❌ Format xato! 5 ta ma'lumot kiritilishi kerak.")
         return
     unique_id = f"OLM-2026-{''.join(random.choices('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', k=6))}"
     async with async_session() as session:
-        session.add(Student(student_id=unique_id, first_name=parts[0], last_name=parts[1], grade=parts[2], school=parts[3]))
+        session.add(Student(student_id=unique_id, first_name=parts[0], last_name=parts[1], age=parts[2], grade=parts[3], school=parts[4]))
         await session.commit()
     await state.clear()
     await message.answer(f"✅ O'quvchi qo'shildi!\nID: <code>{unique_id}</code>", reply_markup=get_admin_menu())
@@ -740,7 +807,7 @@ async def admin_process_excel_students(message: Message, state: FSMContext, bot:
             for _, row in df.iterrows():
                 session.add(Student(
                     student_id=f"OLM-2026-{''.join(random.choices('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', k=6))}",
-                    first_name=str(row.iloc[0]), last_name=str(row.iloc[1]), grade=str(row.iloc[2]), school=str(row.iloc[3])
+                    first_name=str(row.iloc[0]), last_name=str(row.iloc[1]), age=str(row.iloc[2]), grade=str(row.iloc[3]), school=str(row.iloc[4])
                 ))
                 added_count += 1
             await session.commit()
@@ -920,7 +987,7 @@ async def finish_test_by_admin(callback: CallbackQuery):
         test = await session.get(Test, int(callback.data.split("_")[2]))
         if test:
             test.is_active = False
-            test.is_finished = True # Shu orqali o'quvchilarga savollar, tahlil va apellyatsiya ochiladi
+            test.is_finished = True
             await session.commit()
             await callback.answer("Test to'liq yakunlandi! Endi o'quvchilar tahlil va apellyatsiya ko'rishlari mumkin.", show_alert=True)
 
@@ -994,7 +1061,7 @@ async def accept_appeal(callback: CallbackQuery, bot: Bot):
         student = await session.get(Student, appeal.student_id)
         test = await session.get(Test, ts.test_id)
         
-        # Google Sheets jadvalidagi natijani to'g'ri yangilash
+        # Google Sheets jadvalidagi natijani yangilash
         update_result_in_sheet(student.student_id, test.title, ts.score, ts.score_percentage, ts.correct_answers)
         
         if student and student.telegram_id:
@@ -1071,7 +1138,7 @@ async def export_excel_results(message: Message, bot: Bot):
             await message.answer("Natijalar yo'q.")
             return
         df = pd.DataFrame([{
-            "ID": s.student_id, "Ism": s.first_name, "Familiya": s.last_name, "Maktab": s.school,
+            "ID": s.student_id, "Ism": s.first_name, "Familiya": s.last_name, "Yosh": s.age, "Maktab": s.school,
             "Sinf": s.grade, "Fan": t.subject, "Ball": ts.score, "Foiz": ts.score_percentage, "Sana": ts.finished_at
         } for s, ts, t in rows])
         output = io.BytesIO()
