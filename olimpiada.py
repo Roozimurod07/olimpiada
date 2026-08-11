@@ -74,6 +74,7 @@ class Test(Base):
     start_time = Column(DateTime, nullable=True)
     end_time = Column(DateTime, nullable=True)
     is_active = Column(Boolean, default=True)
+    is_finished = Column(Boolean, default=False) # Admin tomonidan test yakunlanganligi
     
     questions = relationship("Question", back_populates="test", cascade="all, delete-orphan")
     test_sessions = relationship("TestSession", back_populates="test", cascade="all, delete-orphan")
@@ -182,11 +183,12 @@ def update_result_in_sheet(student_id, test_title, score, percentage, correct):
     try:
         sheet = get_gspread_sheet()
         records = sheet.get_all_records()
-        for idx, row in enumerate(records, start=2): # 1-qator sarlavha
+        for idx, row in enumerate(records, start=2):
+            # ID va Test nomini to'g'ri solishtirish uchun stringga o'tkazamiz
             if str(row.get("ID")) == str(student_id) and str(row.get("Test")) == str(test_title):
-                sheet.update_cell(idx, 7, str(score))          # Ball ustuni
-                sheet.update_cell(idx, 8, f"{percentage}%")    # Foiz ustuni
-                sheet.update_cell(idx, 9, str(correct))        # To'g'ri javoblar ustuni
+                sheet.update_cell(idx, 7, str(score))          # Ball ustuni (7-ustun)
+                sheet.update_cell(idx, 8, f"{percentage}%")    # Foiz ustuni (8-ustun)
+                sheet.update_cell(idx, 9, str(correct))        # To'g'ri javoblar ustuni (9-ustun)
                 break
     except Exception as e:
         print(f"❌ Google Sheets yangilash xatosi: {e}")
@@ -265,8 +267,8 @@ def get_main_menu():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📝 Testni boshlash"), KeyboardButton(text="👤 Profilim")],
-            [KeyboardButton(text="📊 Mening urinishlarim"), KeyboardButton(text="🏆 Reyting")],
-            [KeyboardButton(text="ℹ️ Olimpiada haqida")]
+            [KeyboardButton(text="📊 Mening urinishlarim"), KeyboardButton(text="⚖️ Apellyatsiya")],
+            [KeyboardButton(text="🏆 Reyting"), KeyboardButton(text="ℹ️ Olimpiada haqida")]
         ],
         resize_keyboard=True
     )
@@ -361,23 +363,57 @@ async def my_attempts_handler(message: Message, state: FSMContext):
             await message.answer("⚠️ Siz hali birorta testni yakunlamagansiz.")
             return
             
-        keyboard_buttons = []
+        text = "📊 <b>Sizning ishlagan testlaringiz natijalari:</b>\n\n"
         for ts, t in sessions:
             date_str = ts.finished_at.strftime("%Y-%m-%d %H:%M") if ts.finished_at else ""
+            status_text = "🟢 Test yakunlangan (Natijalar ochiq)" if t.is_finished else "🟡 Test hali davom etmoqda (Tahlil va apellyatsiya yopilgan)"
+            text += f"📚 <b>{t.subject}</b> ({t.title})\n⭐ Ball: {ts.score} ({ts.score_percentage}%)\n📅 Sana: {date_str}\nStatus: {status_text}\n----------------------------------\n"
+            
+        await message.answer(text)
+
+# --- O'QUVCHILAR UCHUN ALOHIDA APELLYATSIYA BO'LIMI ---
+@router.message(F.text == "⚖️ Apellyatsiya")
+async def student_appeal_menu(message: Message, state: FSMContext):
+    if await state.get_state() == TestProcessState.in_test.state: return
+    async with async_session() as session:
+        student = (await session.execute(select(Student).where(Student.telegram_id == message.from_user.id))).scalar_one_or_none()
+        if not student:
+            await message.answer("Ro'yxatdan o'tmagansiz.")
+            return
+        
+        # Faqat admin yakunlagan (is_finished=True) testlar bo'yicha tahlil va apellyatsiya ko'rsatiladi
+        sessions = (await session.execute(
+            select(TestSession, Test)
+            .join(Test, TestSession.test_id == Test.id)
+            .where(TestSession.student_id == student.id, TestSession.status == "COMPLETED", Test.is_finished == True)
+            .order_by(TestSession.finished_at.desc())
+        )).all()
+        
+        if not sessions:
+            await message.answer("⚠️ Hozirda apellyatsiya berish uchun yakunlangan va natijalari e'lon qilingan testlar mavjud emas.\n(Admin testni to'xtatib, yakunlamaguncha savollar va apellyatsiya yopiq bo'ladi).")
+            return
+            
+        keyboard_buttons = []
+        for ts, t in sessions:
             keyboard_buttons.append([InlineKeyboardButton(
-                text=f"📚 {t.subject} | {ts.score} ball ({ts.score_percentage}%) [{date_str}]",
-                callback_data=f"attempt_detail_{ts.id}"
+                text=f"📚 {t.subject} | {ts.score} ball ({ts.score_percentage}%)",
+                callback_data=f"student_appeal_test_{ts.id}"
             )])
             
         markup = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
-        await message.answer("📊 <b>Sizning ishlagan testlaringiz tarixi:</b>\nTafsilot, sertifikat va xatolar tahlilini ko'rish uchun testni tanlang:", reply_markup=markup)
+        await message.answer("⚖️ <b>Apellyatsiya bo'limi:</b>\n\nSavollar tahlili va apellyatsiya berish uchun testni tanlang:", reply_markup=markup)
 
-@router.callback_query(F.data.startswith("attempt_detail_"))
-async def show_attempt_detail(callback: CallbackQuery):
-    session_id = int(callback.data.split("_")[2])
+@router.callback_query(F.data.startswith("student_appeal_test_"))
+async def show_test_analysis_for_appeal(callback: CallbackQuery):
+    session_id = int(callback.data.split("_")[3])
     async with async_session() as session:
         ts = await session.get(TestSession, session_id)
         test = await session.get(Test, ts.test_id)
+        
+        if not test.is_finished:
+            await callback.answer("Bu test uchun hali tahlil ochiq emas!", show_alert=True)
+            return
+
         questions = (await session.execute(select(Question).where(Question.test_id == test.id))).scalars().all()
         answers = {a.question_id: a.selected_option for a in (await session.execute(select(Answer).where(Answer.session_id == ts.id))).scalars().all()}
         
@@ -402,7 +438,7 @@ async def show_attempt_detail(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("get_cert_"))
 async def download_certificate(callback: CallbackQuery, bot: Bot):
-    session_id = int(callback.data.split("_")[2])
+    session_id = int(callback.data.split("_")[3]) # updated index due to split
     async with async_session() as session:
         ts = await session.get(TestSession, session_id)
         test = await session.get(Test, ts.test_id)
@@ -422,6 +458,13 @@ async def download_certificate(callback: CallbackQuery, bot: Bot):
 async def start_appeal(callback: CallbackQuery, state: FSMContext):
     parts = callback.data.split("_")
     session_id, question_id = int(parts[2]), int(parts[3])
+    async with async_session() as session:
+        ts = await session.get(TestSession, session_id)
+        test = await session.get(Test, ts.test_id)
+        if not test.is_finished:
+            await callback.answer("Test yakunlanmagani uchun apellyatsiya berib bo'lmaydi!", show_alert=True)
+            return
+
     await state.update_data(appeal_session_id=session_id, appeal_question_id=question_id)
     await state.set_state(AppealState.waiting_for_text)
     await callback.message.answer("✍️ Ushbu savol bo'yicha o'z e'tirozingiz yoki apellyatsiya sababingizni yozib yuboring:")
@@ -455,8 +498,9 @@ async def start_test_prompt(message: Message, state: FSMContext):
             await message.answer("❌ Profilingizda sinf ko'rsatilmagan yoki ro'yxatdan o'tmagansiz.")
             return
 
+        # Faqat aktiv va admin yakunlamagan testlar ko'rsatiladi
         tests = (await session.execute(
-            select(Test).where(Test.is_active == True, Test.grade_level == student.grade)
+            select(Test).where(Test.is_active == True, Test.is_finished == False, Test.grade_level == student.grade)
         )).scalars().all()
         
         if not tests:
@@ -474,8 +518,8 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
         student = (await session.execute(select(Student).where(Student.telegram_id == callback.from_user.id))).scalar_one_or_none()
         test = (await session.execute(select(Test).where(Test.id == test_id))).scalar_one_or_none()
         
-        if not test or not test.is_active:
-            await callback.answer("Bu test topilmadi yoki faol emas!", show_alert=True)
+        if not test or not test.is_active or test.is_finished:
+            await callback.answer("Bu test topilmadi yoki yopilgan!", show_alert=True)
             return
 
         now = datetime.utcnow()
@@ -515,6 +559,11 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
         await state.set_state(TestProcessState.in_test)
         
         for index, q in enumerate(questions):
+            # Test davomida admin testni to'xtatgan bo'lsa, testni to'xtatamiz
+            current_test_check = await session.get(Test, test_id)
+            if not current_test_check.is_active or current_test_check.is_finished:
+                break
+
             options = [("A", q.option_a), ("B", q.option_b)]
             if q.option_c: options.append(("C", q.option_c))
             if q.option_d: options.append(("D", q.option_d))
@@ -566,7 +615,7 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
                     save_result_to_sheet(student_obj.student_id, f"{student_obj.first_name} {student_obj.last_name}", student_obj.school or "-", student_obj.grade or "-", test_obj.title, test_obj.subject, sess.score, sess.score_percentage, sess.correct_answers, sess.wrong_answers)
                 
                 await state.clear()
-                await bot.send_message(chat_id=user_id, text=f"🏆 <b>TEST YAKUNLANDI!</b>\n\n✅ To'g'ri: {sess.correct_answers}\n❌ Noto'g'ri: {sess.wrong_answers}\n📊 Foiz: {sess.score_percentage}%\n⭐ Ball: {sess.score}", reply_markup=get_main_menu())
+                await bot.send_message(chat_id=user_id, text=f"🏆 <b>TEST YAKUNLANDI!</b>\n\nNatijangiz saqlandi. Admin testni yakunlagach, batafsil tahlil va apellyatsiya bo'limi ochiladi.", reply_markup=get_main_menu())
 
 @router.callback_query(F.data.startswith("ans_"))
 async def save_answer(callback: CallbackQuery, bot: Bot):
@@ -644,7 +693,7 @@ async def show_specific_test_rating(callback: CallbackQuery):
 @router.message(F.text == "ℹ️ Olimpiada haqida")
 async def about_handler(message: Message, state: FSMContext):
     if await state.get_state() == TestProcessState.in_test.state: return
-    await message.answer("ℹ️ Professional Olimpiada Tizimi v2.0 — Sertifikat va Apellyatsiya funksiyalari bilan.")
+    await message.answer("ℹ️ Professional Olimpiada Tizimi v2.1 — Xavfsizlik va Google Sheets sinxronizatsiyasi bilan.")
 
 @router.message(Command("admin"))
 async def admin_panel(message: Message, state: FSMContext):
@@ -820,7 +869,7 @@ async def admin_save_answers_and_test(message: Message, state: FSMContext):
     async with async_session() as session:
         new_test = Test(
             title=data["title"], subject=data["subject"], grade_level=data["grade"],
-            max_attempts=data["max_attempts"], is_active=True
+            max_attempts=data["max_attempts"], is_active=True, is_finished=False
         )
         session.add(new_test)
         await session.flush()
@@ -843,12 +892,18 @@ async def manage_tests_admin(message: Message):
         if not tests:
             await message.answer("Testlar yo'q.")
             return
-        keyboard = [[
-            InlineKeyboardButton(text=f"[{t.grade_level}] {t.subject} {'🟢' if t.is_active else '🔴'}", callback_data="none"),
-            InlineKeyboardButton(text="🔄", callback_data=f"toggle_test_{t.id}"),
-            InlineKeyboardButton(text="🗑", callback_data=f"delete_test_{t.id}")
-        ] for t in tests]
-        await message.answer("⚙️ Testlar:", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+        keyboard = []
+        for t in tests:
+            status_emoji = '🟢 Aktiv' if t.is_active and not t.is_finished else ('🏁 Yakunlangan' if t.is_finished else '🔴 To\'xtatilgan')
+            keyboard.append([
+                InlineKeyboardButton(text=f"[{t.grade_level}] {t.subject} ({status_emoji})", callback_data="none"),
+            ])
+            keyboard.append([
+                InlineKeyboardButton(text="🔄 Holatni o'zgartirish", callback_data=f"toggle_test_{t.id}"),
+                InlineKeyboardButton(text="🏁 Testni yakunlash", callback_data=f"finish_test_{t.id}"),
+                InlineKeyboardButton(text="🗑 O'chirish", callback_data=f"delete_test_{t.id}")
+            ])
+        await message.answer("⚙️ Testlarni boshqarish:", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
 
 @router.callback_query(F.data.startswith("toggle_test_"))
 async def toggle_test(callback: CallbackQuery):
@@ -857,7 +912,17 @@ async def toggle_test(callback: CallbackQuery):
         if test:
             test.is_active = not test.is_active
             await session.commit()
-            await callback.answer("Holat o'zgardi!")
+            await callback.answer(f"Test holati o'zgardi! Aktiv: {test.is_active}")
+
+@router.callback_query(F.data.startswith("finish_test_"))
+async def finish_test_by_admin(callback: CallbackQuery):
+    async with async_session() as session:
+        test = await session.get(Test, int(callback.data.split("_")[2]))
+        if test:
+            test.is_active = False
+            test.is_finished = True # Shu orqali o'quvchilarga savollar, tahlil va apellyatsiya ochiladi
+            await session.commit()
+            await callback.answer("Test to'liq yakunlandi! Endi o'quvchilar tahlil va apellyatsiya ko'rishlari mumkin.", show_alert=True)
 
 @router.callback_query(F.data.startswith("delete_test_"))
 async def delete_test(callback: CallbackQuery):
@@ -866,7 +931,7 @@ async def delete_test(callback: CallbackQuery):
         if test:
             await session.delete(test)
             await session.commit()
-            await callback.answer("O'chirildi!")
+            await callback.answer("Test o'chirildi!")
 
 @router.message(F.text == "⚖️ Apellyatsiyalar")
 async def admin_appeals_handler(message: Message):
@@ -929,7 +994,7 @@ async def accept_appeal(callback: CallbackQuery, bot: Bot):
         student = await session.get(Student, appeal.student_id)
         test = await session.get(Test, ts.test_id)
         
-        # Google Sheets jadvalidagi natijani yangilash
+        # Google Sheets jadvalidagi natijani to'g'ri yangilash
         update_result_in_sheet(student.student_id, test.title, ts.score, ts.score_percentage, ts.correct_answers)
         
         if student and student.telegram_id:
