@@ -539,7 +539,7 @@ async def show_test_analysis_for_appeal(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("get_cert_"))
 async def download_certificate(callback: CallbackQuery, bot: Bot):
-    session_id = int(callback.data.split("_")[3])
+    session_id = int(callback.data.split("_")[2])
     async with async_session() as session:
         ts = await session.get(TestSession, session_id)
         test = await session.get(Test, ts.test_id)
@@ -1197,6 +1197,7 @@ async def admin_save_answers_and_test(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("✅ Test muvaffaqiyatli saqlandi va o'quvchilarga eslatma jadvali tuzildi!", reply_markup=get_admin_menu())
 
+# --- TO'G'RILANDI: Testlarni boshqarish paneli va uning callbacklari ---
 @router.message(F.text == "⚙️ Testlarni boshqarish")
 async def manage_tests_admin(message: Message):
     if not await is_admin(message.from_user.id): return
@@ -1210,7 +1211,7 @@ async def manage_tests_admin(message: Message):
         for t in tests:
             status_emoji = '🟢 Aktiv' if t.is_active and not t.is_finished else ('🏁 Yakunlangan' if t.is_finished else '🔴 To\'xtatilgan')
             keyboard.append([
-                InlineKeyboardButton(text=f"📚 [{t.grade_level}] {t.subject} ({status_emoji})", callback_data="none")
+                InlineKeyboardButton(text=f"📚 [{t.grade_level}] {t.subject} ({status_emoji})", callback_data="ignore_cb")
             ])
             keyboard.append([
                 InlineKeyboardButton(text="🔄 Holat", callback_data=f"togg_{t.id}"),
@@ -1218,6 +1219,10 @@ async def manage_tests_admin(message: Message):
                 InlineKeyboardButton(text="🗑 O'chirish", callback_data=f"del_{t.id}")
             ])
         await message.answer("⚙️ <b>Testlarni boshqarish:</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+
+@router.callback_query(F.data == "ignore_cb")
+async def ignore_callback(callback: CallbackQuery):
+    await callback.answer()
 
 @router.callback_query(F.data.startswith("togg_"))
 async def toggle_test(callback: CallbackQuery):
@@ -1234,7 +1239,7 @@ async def toggle_test(callback: CallbackQuery):
             keyboard = []
             for t in tests:
                 se = '🟢 Aktiv' if t.is_active and not t.is_finished else ('🏁 Yakunlangan' if t.is_finished else '🔴 To\'xtatilgan')
-                keyboard.append([InlineKeyboardButton(text=f"📚 [{t.grade_level}] {t.subject} ({se})", callback_data="none")])
+                keyboard.append([InlineKeyboardButton(text=f"📚 [{t.grade_level}] {t.subject} ({se})", callback_data="ignore_cb")])
                 keyboard.append([
                     InlineKeyboardButton(text="🔄 Holat", callback_data=f"togg_{t.id}"),
                     InlineKeyboardButton(text="🏁 Tugatish", callback_data=f"fin_{t.id}"),
@@ -1260,7 +1265,7 @@ async def finish_test_by_admin(callback: CallbackQuery):
             keyboard = []
             for t in tests:
                 se = '🟢 Aktiv' if t.is_active and not t.is_finished else ('🏁 Yakunlangan' if t.is_finished else '🔴 To\'xtatilgan')
-                keyboard.append([InlineKeyboardButton(text=f"📚 [{t.grade_level}] {t.subject} ({se})", callback_data="none")])
+                keyboard.append([InlineKeyboardButton(text=f"📚 [{t.grade_level}] {t.subject} ({se})", callback_data="ignore_cb")])
                 keyboard.append([
                     InlineKeyboardButton(text="🔄 Holat", callback_data=f"togg_{t.id}"),
                     InlineKeyboardButton(text="🏁 Tugatish", callback_data=f"fin_{t.id}"),
@@ -1288,7 +1293,7 @@ async def delete_test(callback: CallbackQuery):
             keyboard = []
             for t in tests:
                 se = '🟢 Aktiv' if t.is_active and not t.is_finished else ('🏁 Yakunlangan' if t.is_finished else '🔴 To\'xtatilgan')
-                keyboard.append([InlineKeyboardButton(text=f"📚 [{t.grade_level}] {t.subject} ({se})", callback_data="none")])
+                keyboard.append([InlineKeyboardButton(text=f"📚 [{t.grade_level}] {t.subject} ({se})", callback_data="ignore_cb")])
                 keyboard.append([
                     InlineKeyboardButton(text="🔄 Holat", callback_data=f"togg_{t.id}"),
                     InlineKeyboardButton(text="🏁 Tugatish", callback_data=f"fin_{t.id}"),
@@ -1427,6 +1432,7 @@ async def live_statistics(message: Message):
         completed = await session.scalar(select(func.count(TestSession.id)).where(TestSession.status == "COMPLETED"))
         await message.answer(f"📊 <b>Statistika:</b>\n\nJami o'quvchilar: {total}\nTest topshirganlar: {completed or 0}")
 
+# --- TO'G'RILANDI: Excel natijalarni yuklab olish (join va ma'lumotlarni o'qish optimizatsiya qilindi) ---
 @router.message(F.text == "📥 Excel natijalar")
 async def export_excel_results(message: Message, bot: Bot):
     if not await is_admin(message.from_user.id): return
@@ -1438,7 +1444,7 @@ async def export_excel_results(message: Message, bot: Bot):
         )
         rows = result.all()
         if not rows:
-            await message.answer("Natijalar yo'q.")
+            await message.answer("Hozircha natijalar mavjud emas.")
             return
             
         data_list = []
@@ -1513,7 +1519,7 @@ async def back_to_menu(message: Message, state: FSMContext):
         await message.answer("Asosiy menyu:", reply_markup=main_menu)
 
 async def reminder_scheduler(bot: Bot):
-    while True:
+    while TypeTask := True:
         await asyncio.sleep(60)
         try:
             now = datetime.utcnow()
