@@ -35,6 +35,7 @@ GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON")
 SHEET_NAME = "Olimpiada"
 REQUIRED_CHANNEL = "@olimpiada01111"
 
+# O'z Telegram ID raqamingizni shu yerga yozing!
 SUPER_ADMIN_IDS = [8317043750]
 
 Base = declarative_base()
@@ -1606,7 +1607,9 @@ async def reject_appeal(callback: CallbackQuery, bot: Bot):
 
 @router.message(F.text == "👥 Adminlar")
 async def admins_management(message: Message, state: FSMContext):
-    if message.from_user.id not in SUPER_ADMIN_IDS: return
+    if message.from_user.id not in SUPER_ADMIN_IDS: 
+        await message.answer("⚠️ Bu bo'limga faqat Super Admin kira oladi!")
+        return
     async with async_session() as session:
         admins = (await session.execute(select(Admin))).scalars().all()
         
@@ -1657,15 +1660,26 @@ async def delete_admin(callback: CallbackQuery):
 
 @router.callback_query(F.data == "add_admin")
 async def add_admin_prompt(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in SUPER_ADMIN_IDS:
+        await callback.answer("Sizda bu huquq yo'q!", show_alert=True)
+        return
     await state.set_state(AdminManageAdmins.waiting_for_id)
     await callback.message.answer("Yangi adminning Telegram ID raqamini kiriting:")
     await callback.answer()
 
 @router.message(AdminManageAdmins.waiting_for_id)
 async def save_new_admin(message: Message, state: FSMContext):
+    if message.from_user.id not in SUPER_ADMIN_IDS: return
     try:
         tg_id = int(message.text.strip())
         async with async_session() as session:
+            # Takroran qo'shilishining oldini olish
+            existing = (await session.execute(select(Admin).where(Admin.telegram_id == tg_id))).scalar_one_or_none()
+            if existing:
+                await message.answer("⚠️ Bu foydalanuvchi allaqachon admin ro'yxatida mavjud!", reply_markup=get_admin_menu())
+                await state.clear()
+                return
+
             session.add(Admin(telegram_id=tg_id, role="moderator"))
             await session.commit()
         await state.clear()
