@@ -820,12 +820,19 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
 
         if test.is_block_test:
             # Blok testda aynan 10/10/10/30/30 tarkib olinadi.
+            names = json.loads(test.block_subjects or "{}")
+            sub1 = names.get("sub1") or "Asosiy fan 1"
+            sub2 = names.get("sub2") or "Asosiy fan 2"
             grouped_questions = {
                 "Tarix": [], "Ona tili": [], "Matematika": [],
                 "Asosiy fan 1": [], "Asosiy fan 2": []
             }
             for q in all_questions:
-                if q.section_name in grouped_questions:
+                if q.section_name == sub1:
+                    grouped_questions["Asosiy fan 1"].append(q)
+                elif q.section_name == sub2:
+                    grouped_questions["Asosiy fan 2"].append(q)
+                elif q.section_name in grouped_questions:
                     grouped_questions[q.section_name].append(q)
 
             if any(len(grouped_questions[k]) != BLOCK_COUNTS[k] for k in BLOCK_SECTIONS):
@@ -863,10 +870,17 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
 
         if test.is_block_test:
             # Savollarni 10/10/10/30/30 bo'yicha guruhlaymiz.
+            names=json.loads(test.block_subjects or "{}")
+            sub1=names.get("sub1") or "Asosiy fan 1"
+            sub2=names.get("sub2") or "Asosiy fan 2"
             grouped={"Tarix":[],"Ona tili":[],"Matematika":[],"Asosiy fan 1":[],"Asosiy fan 2":[]}
             for q in all_questions:
-                if q.section_name in grouped:
-                    grouped[q.section_name].append(q.id)
+                sec=q.section_name
+                if sec==sub1: key="Asosiy fan 1"
+                elif sec==sub2: key="Asosiy fan 2"
+                else: key=sec
+                if key in grouped:
+                    grouped[key].append(q.id)
             # Savollar oldindan 10/10/10/30/30 tartibida tanlangan.
             block_question_order[test_session.id] = grouped
             block_current_section[test_session.id]=None
@@ -1181,26 +1195,63 @@ async def save_answer(callback: CallbackQuery, bot: Bot):
     await callback.answer(f"Tanlandi: {selected}")
 
 async def calculate_and_save_results(session, sess: TestSession):
-    # Faqat o'quvchiga tushgan tanlangan savollar bo'yicha hisoblaymiz
+    # Faqat o'quvchiga tushgan savollar bo'yicha hisoblaymiz.
     q_ids = json.loads(sess.selected_question_ids) if sess.selected_question_ids else []
-    questions = (await session.execute(select(Question).where(Question.id.in_(q_ids)))).scalars().all()
-    answers = {a.question_id: a.selected_option for a in (await session.execute(select(Answer).where(Answer.session_id == sess.id))).scalars().all()}
-    
-    correct, wrong, unanswered, total_score = 0, 0, 0, 0.0
+    questions = (await session.execute(
+        select(Question).where(Question.id.in_(q_ids))
+    )).scalars().all()
+
+    answers = {
+        a.question_id: a.selected_option
+        for a in (
+            await session.execute(
+                select(Answer).where(Answer.session_id == sess.id)
+            )
+        ).scalars().all()
+    }
+
+    # Blok test: Tarix/Ona tili/Matematika = 1.1,
+    # Asosiy fan 1 = 3.1, Asosiy fan 2 = 2.1.
+    # Maksimal jami: 189 ball.
+    block_points = {
+        "Tarix": 1.1,
+        "Ona tili": 1.1,
+        "Matematika": 1.1,
+        "Asosiy fan 1": 3.1,
+        "Asosiy fan 2": 2.1,
+    }
+
+    test = await session.get(Test, sess.test_id)
+    is_block = bool(test and test.is_block_test)
+
+    correct, wrong, unanswered = 0, 0, 0
+    total_score = 0.0
+
     for q in questions:
         sel = answers.get(q.id)
-        if not sel: unanswered += 1
+        if not sel:
+            unanswered += 1
         elif sel == q.correct_option:
             correct += 1
-            total_score += q.points
-        else: wrong += 1
-            
+            total_score += (
+                block_points.get(q.section_name, 0.0)
+                if is_block else q.points
+            )
+        else:
+            wrong += 1
+
     total_q = len(questions)
     sess.correct_answers = correct
     sess.wrong_answers = wrong
     sess.unanswered = unanswered
     sess.score = round(total_score, 2)
-    sess.score_percentage = round((correct / total_q) * 100, 2) if total_q > 0 else 0.0
+
+    if is_block:
+        sess.score_percentage = round((total_score / 189.0) * 100, 2)
+    else:
+        sess.score_percentage = (
+            round((correct / total_q) * 100, 2) if total_q > 0 else 0.0
+        )
 
 @router.message(F.text == "🏆 Reyting")
 async def rating_menu_prompt(message: Message, state: FSMContext):
@@ -1960,13 +2011,6 @@ async def admin_save_answers_and_test(message: Message, state: FSMContext):
     for idx, q in enumerate(questions_list):
         q["correct"] = tokens[idx]
     
-    if is_block:
-        counts = {sec: sum(1 for q in questions_list if q.get("block_section") == sec) for sec in BLOCK_SECTIONS}
-        bad = [f"{sec}: {counts[sec]}/{BLOCK_COUNTS[sec]}" for sec in BLOCK_SECTIONS if counts[sec] != BLOCK_COUNTS[sec]]
-        if bad:
-            await message.answer("❌ Blok test saqlanmadi. Tarkib noto'g'ri:\n" + "\n".join(bad))
-            return
-
     async with async_session() as session:
         new_test = Test(
             title=data["title"], 
@@ -1993,10 +2037,10 @@ async def admin_save_answers_and_test(message: Message, state: FSMContext):
             if is_block:
                 sec_name=q.get("block_section")
                 if sec_name=="Asosiy fan 1":
-                    sec_name="Asosiy fan 1"
+                    sec_name=data.get("block_sub1") or "Asosiy fan 1"
                     points=3.1
                 elif sec_name=="Asosiy fan 2":
-                    sec_name="Asosiy fan 2"
+                    sec_name=data.get("block_sub2") or "Asosiy fan 2"
                     points=2.1
                 elif sec_name in ("Tarix","Ona tili","Matematika"):
                     points=1.1
@@ -2172,13 +2216,29 @@ async def accept_appeal(callback: CallbackQuery, bot: Bot):
         appeal.status = "APPROVED"
         
         ts = await session.get(TestSession, appeal.test_session_id)
-        ts.score += 1.0
+        test_obj = await session.get(Test, ts.test_id)
+        appealed_question = await session.get(Question, appeal.question_id)
+
+        if test_obj and test_obj.is_block_test:
+            appeal_points = {
+                "Tarix": 1.1,
+                "Ona tili": 1.1,
+                "Matematika": 1.1,
+                "Asosiy fan 1": 3.1,
+                "Asosiy fan 2": 2.1,
+            }
+            ts.score += appeal_points.get(
+                appealed_question.section_name if appealed_question else "", 0.0
+            )
+            ts.score_percentage = round((ts.score / 189.0) * 100, 2)
+        else:
+            ts.score += 1.0
+            q_ids = json.loads(ts.selected_question_ids) if ts.selected_question_ids else []
+            questions_count = len(q_ids)
+            if questions_count > 0:
+                ts.score_percentage = round((ts.score / questions_count) * 100, 2)
+
         ts.correct_answers += 1
-        
-        q_ids = json.loads(ts.selected_question_ids) if ts.selected_question_ids else []
-        questions_count = len(q_ids)
-        if questions_count > 0:
-            ts.score_percentage = round((ts.score / questions_count) * 100, 2)
             
         await session.commit()
         
