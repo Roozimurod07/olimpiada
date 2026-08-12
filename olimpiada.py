@@ -13,8 +13,14 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+try:
+    from aiogram.fsm.storage.redis import RedisStorage
+    from redis.asyncio import Redis
+except ImportError:
+    RedisStorage = None
+    Redis = None
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, BufferedInputFile
-from sqlalchemy import Column, Integer, String, Text, DateTime, Boolean, ForeignKey, Float, select, update, delete, func, text as sa_text, event
+from sqlalchemy import Column, Integer, String, Text, DateTime, Boolean, ForeignKey, Float, Index, select, update, delete, func, text as sa_text, event
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from sqlalchemy.orm import declarative_base, relationship
 
@@ -153,20 +159,61 @@ class Appeal(Base):
 
 DB_DIR = os.getenv("DB_DIR", ".")
 DB_PATH = os.path.join(DB_DIR, "professional_olimpiada.db")
-engine = create_async_engine(f"sqlite+aiosqlite:///{DB_PATH}", echo=False)
+DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite+aiosqlite:///{DB_PATH}")
+
+if DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
+
+if DATABASE_URL.startswith("sqlite"):
+    engine = create_async_engine(
+        DATABASE_URL,
+        echo=False,
+        connect_args={"timeout": 30},
+    )
+else:
+    engine = create_async_engine(
+        DATABASE_URL,
+        echo=False,
+        pool_pre_ping=True,
+        pool_size=int(os.getenv("DB_POOL_SIZE", "20")),
+        max_overflow=int(os.getenv("DB_MAX_OVERFLOW", "40")),
+    )
 
 @event.listens_for(engine.sync_engine, "connect")
-def set_sqlite_pragma(dbapi_connection, connection_record):
-    cursor = dbapi_connection.cursor()
-    cursor.execute("PRAGMA foreign_keys=ON")
-    cursor.close()
+def set_db_pragmas(dbapi_connection, connection_record):
+    # SQLite uchun ko'p parallel yozuvlarda ancha barqaror ishlash.
+    if DATABASE_URL.startswith("sqlite"):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.close()
 
 async_session = async_sessionmaker(engine, expire_on_commit=False)
 
+# 1000 ta testchi uchun har bir foydalanuvchiga alohida CPU loop emas, event ishlatamiz.
+active_question_by_session: dict[int, int] = {}
+answer_events: dict[int, asyncio.Event] = {}
+
+# Telegram Bot API'ga 1000 foydalanuvchi x 1 edit/soniya yuborish xavfli.
+# Default 5 soniya: vaqt server tomonda aniq yuradi, UI esa yengilroq yangilanadi.
+TIMER_UPDATE_INTERVAL = max(1, int(os.getenv("TIMER_UPDATE_INTERVAL", "5")))
+SHEETS_SEMAPHORE = asyncio.Semaphore(max(1, int(os.getenv("SHEETS_CONCURRENCY", "3"))))
+
 async def init_db():
     async with engine.begin() as conn:
-        await conn.execute(sa_text("PRAGMA foreign_keys = ON;"))
+        if DATABASE_URL.startswith("sqlite"):
+            await conn.execute(sa_text("PRAGMA foreign_keys = ON;"))
         await conn.run_sync(Base.metadata.create_all)
+        # Eski bazalarda ham kerakli indekslarni yaratamiz.
+        await conn.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_test_sessions_student_test_status ON test_sessions(student_id, test_id, status)"))
+        await conn.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_test_sessions_test_status_score ON test_sessions(test_id, status, score DESC)"))
+        await conn.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_answers_session_question ON answers(session_id, question_id)"))
+        try:
+            await conn.execute(sa_text("CREATE UNIQUE INDEX IF NOT EXISTS ux_answers_session_question ON answers(session_id, question_id)"))
+        except Exception:
+            pass
         
         try:
             await conn.execute(sa_text("SELECT questions_count_to_show FROM tests LIMIT 1"))
@@ -220,30 +267,40 @@ def get_gspread_sheet():
     client = gspread.authorize(creds)
     return client.open(SHEET_NAME).sheet1
 
-def save_result_to_sheet(student_id, full_name, age, school, grade, test_title, subject, score, percentage, correct, wrong):
-    try:
-        sheet = get_gspread_sheet()
-        row_data = [
-            str(student_id), str(full_name), str(age), str(school), str(grade),
-            str(subject), str(test_title), str(score), f"{percentage}%",
-            str(correct), str(wrong), datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        ]
-        sheet.append_row(row_data)
-    except Exception as e:
-        print(f"❌ Google Sheets qo'shish xatosi: {e}")
+def _save_result_to_sheet_sync(student_id, full_name, age, school, grade, test_title, subject, score, percentage, correct, wrong):
+    sheet = get_gspread_sheet()
+    row_data = [
+        str(student_id), str(full_name), str(age), str(school), str(grade),
+        str(subject), str(test_title), str(score), f"{percentage}%",
+        str(correct), str(wrong), datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    ]
+    sheet.append_row(row_data)
 
-def update_result_in_sheet(student_id, test_title, score, percentage, correct):
+async def save_result_to_sheet(*args):
+    # gspread sinxron kutubxona; event loopni bloklamaslik va 1000 ta
+    # yakunlanishda yuzlab thread ochilmasligi uchun semaphore ishlatamiz.
     try:
-        sheet = get_gspread_sheet()
-        records = sheet.get_all_records()
-        for idx, row in enumerate(records, start=2):
-            if str(row.get("ID")) == str(student_id) and str(row.get("Test")) == str(test_title):
-                sheet.update_cell(idx, 8, str(score))
-                sheet.update_cell(idx, 9, f"{percentage}%")
-                sheet.update_cell(idx, 10, str(correct))
-                break
+        async with SHEETS_SEMAPHORE:
+            await asyncio.to_thread(_save_result_to_sheet_sync, *args)
     except Exception as e:
-        print(f"❌ Google Sheets yangilash xatosi: {e}")
+        logging.exception("Google Sheets qo'shish xatosi: %s", e)
+
+def _update_result_in_sheet_sync(student_id, test_title, score, percentage, correct):
+    sheet = get_gspread_sheet()
+    records = sheet.get_all_records()
+    for idx, row in enumerate(records, start=2):
+        if str(row.get("ID")) == str(student_id) and str(row.get("Test")) == str(test_title):
+            sheet.update_cell(idx, 8, str(score))
+            sheet.update_cell(idx, 9, f"{percentage}%")
+            sheet.update_cell(idx, 10, str(correct))
+            break
+
+async def update_result_in_sheet(*args):
+    try:
+        async with SHEETS_SEMAPHORE:
+            await asyncio.to_thread(_update_result_in_sheet_sync, *args)
+    except Exception as e:
+        logging.exception("Google Sheets yangilash xatosi: %s", e)
 
 def generate_certificate_pdf(student_name, test_title, subject, score_pct):
     pdf_buffer = io.BytesIO()
@@ -670,12 +727,24 @@ async def start_block_test_prompt(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("start_test_"))
 async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bot):
-    test_id = int(callback.data.split("_")[2])
-    
+    try:
+        test_id = int(callback.data.split("_")[2])
+    except (ValueError, IndexError):
+        await callback.answer("❌ Test tugmasi noto'g'ri.", show_alert=True)
+        return
+
+    user_id = callback.from_user.id
+    # Muhim: bu session faqat testni boshlash uchun ishlatiladi.
+    # Endi uni 30-180 daqiqa ochiq ushlab turmaymiz.
     async with async_session() as session:
-        student = (await session.execute(select(Student).where(Student.telegram_id == callback.from_user.id))).scalar_one_or_none()
-        test = (await session.execute(select(Test).where(Test.id == test_id))).scalar_one_or_none()
-        
+        student = (await session.execute(
+            select(Student).where(Student.telegram_id == user_id)
+        )).scalar_one_or_none()
+        test = await session.get(Test, test_id)
+
+        if not student or not student.is_active:
+            await callback.answer("❌ Profil topilmadi yoki bloklangan.", show_alert=True)
+            return
         if not test or not test.is_active or test.is_finished:
             await callback.answer("Bu test topilmadi yoki yopilgan!", show_alert=True)
             return
@@ -684,7 +753,7 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
         if test.start_time:
             start_t = test.start_time.replace(tzinfo=timezone.utc) if test.start_time.tzinfo is None else test.start_time
             if now < start_t:
-                await callback.answer(f"⏳ Test hali boshlanmagan! Boshlanish vaqti: {start_t.strftime('%Y-%m-%d %H:%M')}", show_alert=True)
+                await callback.answer(f"⏳ Test hali boshlanmagan! {start_t.strftime('%Y-%m-%d %H:%M')}", show_alert=True)
                 return
         if test.end_time:
             end_t = test.end_time.replace(tzinfo=timezone.utc) if test.end_time.tzinfo is None else test.end_time
@@ -692,110 +761,142 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
                 await callback.answer("⏰ Bu testning vaqti tugagan!", show_alert=True)
                 return
 
+        # Bir vaqtning o'zida shu testda ikkinchi IN_PROGRESS sessiyani ochishga yo'l qo'ymaymiz.
+        active_count = await session.scalar(select(func.count(TestSession.id)).where(
+            TestSession.student_id == student.id,
+            TestSession.test_id == test_id,
+            TestSession.status == "IN_PROGRESS"
+        ))
+        if active_count:
+            await callback.answer("⚠️ Sizda bu test allaqachon boshlangan.", show_alert=True)
+            return
+
         if test.max_attempts > 0:
-            attempts_count = await session.scalar(
-                select(func.count(TestSession.id)).where(
-                    TestSession.student_id == student.id,
-                    TestSession.test_id == test_id,
-                    TestSession.status == "COMPLETED"
-                )
-            )
+            attempts_count = await session.scalar(select(func.count(TestSession.id)).where(
+                TestSession.student_id == student.id,
+                TestSession.test_id == test_id,
+                TestSession.status == "COMPLETED"
+            ))
             if attempts_count >= test.max_attempts:
                 await callback.answer(f"❌ Urinishlar soni tugagan: {test.max_attempts}", show_alert=True)
                 return
 
-        all_questions = (await session.execute(select(Question).where(Question.test_id == test_id))).scalars().all()
+        # Faqat kerakli ustunlarni olib, RAMni ortiqcha to'ldirmaymiz.
+        all_questions = (await session.execute(
+            select(Question).where(Question.test_id == test_id)
+        )).scalars().all()
         if not all_questions:
             await callback.answer("Bu testda savollar yo'q!", show_alert=True)
             return
-            
-        # Admin belgilagan miqdor yoki jami savollar sonidan kamrog'ini tasodifiy tanlash
-        count_to_pick = min(test.questions_count_to_show, len(all_questions))
+
+        count_to_pick = min(test.questions_count_to_show or 30, len(all_questions))
         selected_questions = random.sample(all_questions, count_to_pick)
-        # Savollar tartibini ham har bir o'quvchiga aralashtirib yuborish
         random.shuffle(selected_questions)
-        
         selected_q_ids = [q.id for q in selected_questions]
 
         test_session = TestSession(
-            student_id=student.id, 
-            test_id=test_id, 
+            student_id=student.id,
+            test_id=test_id,
             status="IN_PROGRESS",
-            selected_question_ids=json.dumps(selected_q_ids)
+            started_at=now,
+            selected_question_ids=json.dumps(selected_q_ids),
         )
         session.add(test_session)
         await session.commit()
         await session.refresh(test_session)
 
-        await callback.message.edit_text(f"🚀 <b>{test.subject} ({test.title})</b> testi boshlandi!\nSizga {len(selected_questions)} ta savol tasodifiy taqdim etildi.")
-        user_id = callback.from_user.id
-        await state.set_state(TestProcessState.in_test)
-        
-        total_duration_sec = test.duration_minutes * 60
-        start_timestamp = datetime.now(timezone.utc)
-        
+        # Keyingi kod DB sessiondan tashqarida ishlaydi.
+        subject = test.subject
+        title = test.title
+        total_duration_sec = max(1, int(test.duration_minutes or 60) * 60)
+        question_seconds = max(1, int(test.question_time_seconds or 60))
+
+    await callback.message.edit_text(
+        f"🚀 <b>{subject} ({title})</b> testi boshlandi!\n"
+        f"Sizga {len(selected_questions)} ta savol tasodifiy taqdim etildi."
+    )
+    await state.set_state(TestProcessState.in_test)
+
+    session_event = asyncio.Event()
+    answer_events[test_session.id] = session_event
+    test_started_at = now
+
+    try:
         for index, q in enumerate(selected_questions):
-            current_test_check = await session.get(Test, test_id)
-            if not current_test_check.is_active or current_test_check.is_finished:
+            # Testning umumiy server vaqti tugaganini aniq hisoblaymiz.
+            elapsed_total = (datetime.now(timezone.utc) - test_started_at).total_seconds()
+            remaining_total = total_duration_sec - elapsed_total
+            if remaining_total <= 0:
+                await bot.send_message(user_id, "⏰ Test uchun ajratilgan umumiy vaqt tugadi!")
                 break
 
-            elapsed = (datetime.now(timezone.utc) - start_timestamp).total_seconds()
-            if elapsed >= total_duration_sec:
-                await bot.send_message(chat_id=user_id, text="⏰ Test uchun ajratilgan umumiy vaqt tugadi!")
-                break
+            async with async_session() as check_session:
+                current_test = await check_session.get(Test, test_id)
+                current_session = await check_session.get(TestSession, test_session.id)
+                if not current_session or current_session.status != "IN_PROGRESS":
+                    break
+                if not current_test or not current_test.is_active or current_test.is_finished:
+                    break
+
+            active_question_by_session[test_session.id] = q.id
+            session_event.clear()
 
             options = [("A", q.option_a), ("B", q.option_b)]
-            if q.option_c: options.append(("C", q.option_c))
-            if q.option_d: options.append(("D", q.option_d))
-            
-            # Variantlarni ham o'quvchiga har xil qilish mumkin yoki shundoq qoldirish mumkin. Hozircha tartibini saqlaymiz.
+            if q.option_c:
+                options.append(("C", q.option_c))
+            if q.option_d:
+                options.append(("D", q.option_d))
+
             keyboard_buttons = []
             row = []
             for opt_key, text_val in options:
-                row.append(InlineKeyboardButton(text=f"{opt_key}) {text_val}", callback_data=f"ans_{test_session.id}_{q.id}_{opt_key}"))
+                row.append(InlineKeyboardButton(
+                    text=f"{opt_key}) {text_val}",
+                    callback_data=f"ans_{test_session.id}_{q.id}_{opt_key}"
+                ))
                 if len(row) == 2:
                     keyboard_buttons.append(row)
                     row = []
-            if row: keyboard_buttons.append(row)
-            
+            if row:
+                keyboard_buttons.append(row)
+
             markup = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
-            
             sec_title = f"<b>Fan / Bo'lim: {q.section_name}</b>\n" if q.section_name else ""
             text_content = f"{sec_title}<b>Savol {index + 1} / {len(selected_questions)}</b> (Ball: {q.points})\n\n{q.question_text}"
-            
+
             if q.photo_file_id:
-                q_msg = await bot.send_photo(chat_id=user_id, photo=q.photo_file_id, caption=text_content, reply_markup=markup)
+                q_msg = await bot.send_photo(user_id, q.photo_file_id, caption=text_content, reply_markup=markup)
             else:
-                q_msg = await bot.send_message(chat_id=user_id, text=text_content, reply_markup=markup)
+                q_msg = await bot.send_message(user_id, text_content, reply_markup=markup)
 
-            q_start_time = datetime.now(timezone.utc)
-            question_seconds = max(1, int(test.question_time_seconds))
+            # Timer UI: serverdagi deadline aniq; Telegram limitlari sabab har soniyada edit qilmaymiz.
             timer_msg = await bot.send_message(
-                chat_id=user_id,
-                text=f"⏳ <b>Qolgan vaqt: {question_seconds} soniya</b>"
+                user_id,
+                f"⏳ <b>Qolgan vaqt: {min(question_seconds, int(remaining_total))} soniya</b>"
             )
-            last_second = question_seconds
-
-            user_next_question_flags.pop(user_id, None)
+            question_started_at = datetime.now(timezone.utc)
+            deadline = question_started_at + timedelta(seconds=min(question_seconds, remaining_total))
+            last_displayed = None
 
             while True:
-                await asyncio.sleep(0.2)
-                now = datetime.now(timezone.utc)
-                total_elapsed = (now - start_timestamp).total_seconds()
-                q_elapsed = (now - q_start_time).total_seconds()
+                now_loop = datetime.now(timezone.utc)
+                remaining_q = max(0.0, (deadline - now_loop).total_seconds())
+                remaining_total = max(0.0, total_duration_sec - (now_loop - test_started_at).total_seconds())
 
-                if total_elapsed >= total_duration_sec:
+                if session_event.is_set() or remaining_q <= 0 or remaining_total <= 0:
                     break
 
-                if user_id in user_next_question_flags:
-                    user_next_question_flags.pop(user_id, None)
+                # Bir taskda faqat bitta timer sleep; 0.2 sekundlik 1000 ta loop yo'q.
+                sleep_for = min(TIMER_UPDATE_INTERVAL, remaining_q, remaining_total)
+                try:
+                    await asyncio.wait_for(session_event.wait(), timeout=max(0.05, sleep_for))
                     break
+                except asyncio.TimeoutError:
+                    pass
 
-                seconds_left = max(0, int(question_seconds - q_elapsed + 0.999))
-                if seconds_left != last_second:
-                    last_second = seconds_left
-                    if seconds_left <= 0:
-                        break
+                seconds_left = max(0, int((deadline - datetime.now(timezone.utc)).total_seconds() + 0.999))
+                if seconds_left != last_displayed and seconds_left > 0:
+                    last_displayed = seconds_left
                     try:
                         await bot.edit_message_text(
                             chat_id=user_id,
@@ -805,21 +906,18 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
                     except Exception:
                         pass
 
-                if q_elapsed >= question_seconds:
-                    break
+            # Savolni tugatishdan oldin timer va savolni tozalaymiz.
+            for msg_id in (timer_msg.message_id, q_msg.message_id):
+                try:
+                    await bot.delete_message(user_id, msg_id)
+                except Exception:
+                    pass
 
-            try:
-                await bot.delete_message(chat_id=user_id, message_id=timer_msg.message_id)
-            except Exception:
-                pass
-            try:
-                await bot.delete_message(chat_id=user_id, message_id=q_msg.message_id)
-            except Exception:
-                pass
-            
-            if (datetime.now(timezone.utc) - start_timestamp).total_seconds() >= total_duration_sec:
+            if remaining_total <= 0:
+                await bot.send_message(user_id, "⏰ Test uchun ajratilgan umumiy vaqt tugadi!")
                 break
 
+        # Natijani faqat bir marta, transaction ichida saqlaymiz.
         async with async_session() as final_session:
             sess = await final_session.get(TestSession, test_session.id)
             if sess and sess.status == "IN_PROGRESS":
@@ -827,29 +925,91 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
                 sess.finished_at = datetime.now(timezone.utc)
                 await calculate_and_save_results(final_session, sess)
                 await final_session.commit()
-                
+
                 student_obj = await final_session.get(Student, sess.student_id)
                 test_obj = await final_session.get(Test, sess.test_id)
+                result_data = None
                 if student_obj and test_obj:
-                    save_result_to_sheet(student_obj.student_id, f"{student_obj.first_name} {student_obj.last_name}", student_obj.age or "-", student_obj.school or "-", student_obj.grade or "-", test_obj.title, test_obj.subject, sess.score, sess.score_percentage, sess.correct_answers, sess.wrong_answers)
-                
-                await state.clear()
-                main_menu = await get_main_menu_keyboard()
-                await bot.send_message(chat_id=user_id, text=f"🏆 <b>TEST YAKUNLANDI!</b>\n\nNatijangiz: {sess.score} ball ({sess.score_percentage}%).", reply_markup=main_menu)
+                    result_data = (
+                        student_obj.student_id,
+                        f"{student_obj.first_name} {student_obj.last_name}",
+                        student_obj.age or "-", student_obj.school or "-", student_obj.grade or "-",
+                        test_obj.title, test_obj.subject, sess.score, sess.score_percentage,
+                        sess.correct_answers, sess.wrong_answers
+                    )
+                result_text = f"🏆 <b>TEST YAKUNLANDI!</b>\n\nNatijangiz: {sess.score} ball ({sess.score_percentage}%)."
+            else:
+                result_data = None
+                result_text = "ℹ️ Test sessiyasi allaqachon yakunlangan."
 
-user_next_question_flags = {}
+        if result_data:
+            # Google Sheets asosiy natija emas; u alohida background task.
+            asyncio.create_task(save_result_to_sheet(*result_data))
+
+        await state.clear()
+        await bot.send_message(user_id, result_text, reply_markup=await get_main_menu_keyboard())
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logging.exception("Test sessiyasi xatosi: session_id=%s", test_session.id)
+        # Bot xatoda ham sessiyani osilib qolgan holatda qoldirmaydi.
+        async with async_session() as session:
+            sess = await session.get(TestSession, test_session.id)
+            if sess and sess.status == "IN_PROGRESS":
+                sess.status = "COMPLETED"
+                sess.finished_at = datetime.now(timezone.utc)
+                await calculate_and_save_results(session, sess)
+                await session.commit()
+        await state.clear()
+        await bot.send_message(user_id, "⚠️ Testda texnik xatolik yuz berdi. Saqlangan javoblaringiz bo'yicha natija hisoblandi.", reply_markup=await get_main_menu_keyboard())
+    finally:
+        active_question_by_session.pop(test_session.id, None)
+        answer_events.pop(test_session.id, None)
 
 @router.callback_query(F.data.startswith("ans_"))
 async def save_answer(callback: CallbackQuery, bot: Bot):
-    parts = callback.data.split("_")
-    session_id, question_id, selected = int(parts[1]), int(parts[2]), parts[3]
-    async with async_session() as session:
-        existing = (await session.execute(select(Answer).where(Answer.session_id == session_id, Answer.question_id == question_id))).scalar_one_or_none()
-        if existing: existing.selected_option = selected
-        else: session.add(Answer(session_id=session_id, question_id=question_id, selected_option=selected))
-        await session.commit()
+    try:
+        parts = callback.data.split("_")
+        session_id, question_id, selected = int(parts[1]), int(parts[2]), parts[3].upper()
+    except (ValueError, IndexError):
+        await callback.answer("❌ Javob tugmasi noto'g'ri.", show_alert=True)
+        return
 
-    user_next_question_flags[callback.from_user.id] = {"target_index": None}
+    event_to_wake = None
+    async with async_session() as session:
+        test_session = await session.get(TestSession, session_id)
+        if not test_session or test_session.status != "IN_PROGRESS":
+            await callback.answer("⏰ Bu test sessiyasi faol emas.", show_alert=True)
+            return
+
+        student = await session.get(Student, test_session.student_id)
+        if not student or student.telegram_id != callback.from_user.id:
+            await callback.answer("❌ Bu savol sizga tegishli emas.", show_alert=True)
+            return
+
+        active_q = active_question_by_session.get(session_id)
+        if active_q is not None and active_q != question_id:
+            await callback.answer("⚠️ Bu savol uchun vaqt tugagan yoki keyingi savol berilgan.", show_alert=True)
+            return
+
+        question = await session.get(Question, question_id)
+        if not question or question.test_id != test_session.test_id:
+            await callback.answer("❌ Savol topilmadi.", show_alert=True)
+            return
+
+        # Bir savolga qayta bosilsa javobni yangilaymiz.
+        existing = (await session.execute(
+            select(Answer).where(Answer.session_id == session_id, Answer.question_id == question_id)
+        )).scalar_one_or_none()
+        if existing:
+            existing.selected_option = selected
+        else:
+            session.add(Answer(session_id=session_id, question_id=question_id, selected_option=selected))
+        await session.commit()
+        event_to_wake = answer_events.get(session_id)
+
+    if event_to_wake:
+        event_to_wake.set()
     await callback.answer(f"Tanlandi: {selected}")
 
 async def calculate_and_save_results(session, sess: TestSession):
@@ -1621,7 +1781,7 @@ async def accept_appeal(callback: CallbackQuery, bot: Bot):
         student = await session.get(Student, appeal.student_id)
         test = await session.get(Test, ts.test_id)
         
-        update_result_in_sheet(student.student_id, test.title, ts.score, ts.score_percentage, ts.correct_answers)
+        asyncio.create_task(update_result_in_sheet(student.student_id, test.title, ts.score, ts.score_percentage, ts.correct_answers))
         
         if student and student.telegram_id:
             try:
@@ -1813,3 +1973,52 @@ async def reminder_scheduler(bot: Bot):
                 pass
         except Exception:
             pass
+
+async def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN environment variable topilmadi.")
+
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO"),
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    )
+
+    await init_db()
+
+    # Redis mavjud bo'lsa FSM restartdan keyin ham saqlanadi; bo'lmasa MemoryStorage fallback.
+    storage = MemoryStorage()
+    redis_client = None
+    if RedisStorage is not None and Redis is not None and os.getenv("REDIS_URL"):
+        try:
+            redis_client = Redis.from_url(os.getenv("REDIS_URL"), decode_responses=False)
+            await redis_client.ping()
+            storage = RedisStorage(redis_client)
+            logging.info("Redis FSM storage yoqildi.")
+        except Exception:
+            logging.exception("Redis ulanmagan, MemoryStorage ishlatiladi.")
+            if redis_client:
+                await redis_client.aclose()
+            redis_client = None
+
+    bot = Bot(
+        token=BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+    )
+    dp = Dispatcher(storage=storage)
+    dp.include_router(router)
+
+    try:
+        logging.info("Olimpiada bot ishga tushdi. TIMER_UPDATE_INTERVAL=%ss", TIMER_UPDATE_INTERVAL)
+        await dp.start_polling(
+            bot,
+            allowed_updates=dp.resolve_used_update_types(),
+            handle_signals=True,
+        )
+    finally:
+        await bot.session.close()
+        if redis_client:
+            await redis_client.aclose()
+        await engine.dispose()
+
+if __name__ == "__main__":
+    asyncio.run(main())
