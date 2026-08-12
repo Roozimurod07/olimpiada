@@ -1609,9 +1609,51 @@ async def admins_management(message: Message, state: FSMContext):
     if message.from_user.id not in SUPER_ADMIN_IDS: return
     async with async_session() as session:
         admins = (await session.execute(select(Admin))).scalars().all()
-        text = "👥 <b>Moderator adminlar:</b>\n\n" + "\n".join([str(a.telegram_id) for a in admins]) if admins else "Adminlar yo'q."
-        keyboard = [[InlineKeyboardButton(text="➕ Admin qo'shish", callback_data="add_admin")]]
+        
+        keyboard = []
+        if admins:
+            for adm in admins:
+                keyboard.append([
+                    InlineKeyboardButton(text=f"👤 {adm.telegram_id} ({adm.role})", callback_data="none"),
+                    InlineKeyboardButton(text="❌ O'chirish", callback_data=f"del_admin_{adm.id}")
+                ])
+        
+        keyboard.append([InlineKeyboardButton(text="➕ Admin qo'shish", callback_data="add_admin")])
+        
+        text = "👥 <b>Moderator adminlar ro'yxati:</b>" if admins else "👥 <b>Moderator adminlar yo'q.</b>"
         await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+
+@router.callback_query(F.data.startswith("del_admin_"))
+async def delete_admin(callback: CallbackQuery):
+    if callback.from_user.id not in SUPER_ADMIN_IDS:
+        await callback.answer("Sizda bu huquq yo'q!", show_alert=True)
+        return
+    
+    admin_db_id = int(callback.data.split("_")[2])
+    async with async_session() as session:
+        admin_obj = await session.get(Admin, admin_db_id)
+        if admin_obj:
+            await session.delete(admin_obj)
+            await session.commit()
+            await callback.answer("✅ Admin muvaffaqiyatli olib tashlandi!", show_alert=True)
+        else:
+            await callback.answer("❌ Admin topilmadi!", show_alert=True)
+            
+        admins = (await session.execute(select(Admin))).scalars().all()
+        keyboard = []
+        if admins:
+            for adm in admins:
+                keyboard.append([
+                    InlineKeyboardButton(text=f"👤 {adm.telegram_id} ({adm.role})", callback_data="none"),
+                    InlineKeyboardButton(text="❌ O'chirish", callback_data=f"del_admin_{adm.id}")
+                ])
+        keyboard.append([InlineKeyboardButton(text="➕ Admin qo'shish", callback_data="add_admin")])
+        
+        text = "👥 <b>Moderator adminlar ro'yxati:</b>" if admins else "👥 <b>Moderator adminlar yo'q.</b>"
+        try:
+            await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+        except Exception:
+            pass
 
 @router.callback_query(F.data == "add_admin")
 async def add_admin_prompt(callback: CallbackQuery, state: FSMContext):
