@@ -76,7 +76,6 @@ class Test(Base):
     mode = Column(String(20), default="global_timer")
     duration_minutes = Column(Integer, default=180)
     question_time_seconds = Column(Integer, default=60)
-    questions_count_to_show = Column(Integer, default=30)  # O'quvchiga nechta savol chiqishi
     is_block_test = Column(Boolean, default=False)
     block_subjects = Column(Text, nullable=True)
     start_time = Column(DateTime, nullable=True)
@@ -117,7 +116,6 @@ class TestSession(Base):
     correct_answers = Column(Integer, default=0)
     wrong_answers = Column(Integer, default=0)
     unanswered = Column(Integer, default=0)
-    selected_question_ids = Column(Text, nullable=True) # O'quvchiga tushgan savollar ID lari (JSON ko'rinishida)
 
     student = relationship("Student", back_populates="test_sessions")
     test = relationship("Test", back_populates="test_sessions")
@@ -169,17 +167,10 @@ async def init_db():
         await conn.run_sync(Base.metadata.create_all)
         
         try:
-            await conn.execute(sa_text("SELECT questions_count_to_show FROM tests LIMIT 1"))
+            await conn.execute(sa_text("SELECT question_time_seconds FROM tests LIMIT 1"))
         except Exception:
             try:
-                await conn.execute(sa_text("ALTER TABLE tests ADD COLUMN questions_count_to_show INTEGER DEFAULT 30;"))
-            except Exception:
-                pass
-        try:
-            await conn.execute(sa_text("SELECT selected_question_ids FROM test_sessions LIMIT 1"))
-        except Exception:
-            try:
-                await conn.execute(sa_text("ALTER TABLE test_sessions ADD COLUMN selected_question_ids TEXT;"))
+                await conn.execute(sa_text("ALTER TABLE tests ADD COLUMN question_time_seconds INTEGER DEFAULT 60;"))
             except Exception:
                 pass
         
@@ -299,7 +290,6 @@ class AdminAddTest(StatesGroup):
     waiting_for_is_block = State()
     waiting_for_block_sub1 = State()
     waiting_for_block_sub2 = State()
-    waiting_for_question_count = State() # Yangi state: Nechta savol tushishi
     waiting_for_question_time = State()
     waiting_for_attempts = State()
     waiting_for_start_time = State()
@@ -532,13 +522,7 @@ async def show_test_analysis_for_appeal(callback: CallbackQuery):
             await callback.answer("Bu test uchun hali tahlil ochiq emas!", show_alert=True)
             return
 
-        # O'quvchiga tushgan savollar ID larini olish
-        q_ids = json.loads(ts.selected_question_ids) if ts.selected_question_ids else []
-        questions = (await session.execute(select(Question).where(Question.id.in_(q_ids)))).scalars().all()
-        # Tartibni saqlash uchun
-        q_dict = {q.id: q for q in questions}
-        ordered_questions = [q_dict[qid] for qid in q_ids if qid in q_dict]
-
+        questions = (await session.execute(select(Question).where(Question.test_id == test.id))).scalars().all()
         answers = {a.question_id: a.selected_option for a in (await session.execute(select(Answer).where(Answer.session_id == ts.id))).scalars().all()}
         
         text = f"📋 <b>Test tahlili: {test.subject} ({test.title})</b>\n" \
@@ -546,7 +530,7 @@ async def show_test_analysis_for_appeal(callback: CallbackQuery):
                f"✅ To'g'ri: {ts.correct_answers} | ❌ Noto'g'ri: {ts.wrong_answers} | ⭕ Javobsiz: {ts.unanswered}\n\n"
                
         keyboard = []
-        for idx, q in enumerate(ordered_questions, 1):
+        for idx, q in enumerate(questions, 1):
             sel = answers.get(q.id, "Javob berilmagan")
             status = "✅" if sel == q.correct_option else "❌"
             sec = f"[{q.section_name}] " if q.section_name else ""
@@ -704,37 +688,24 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
                 await callback.answer(f"❌ Urinishlar soni tugagan: {test.max_attempts}", show_alert=True)
                 return
 
-        all_questions = (await session.execute(select(Question).where(Question.test_id == test_id))).scalars().all()
-        if not all_questions:
+        questions = (await session.execute(select(Question).where(Question.test_id == test_id))).scalars().all()
+        if not questions:
             await callback.answer("Bu testda savollar yo'q!", show_alert=True)
             return
             
-        # Admin belgilagan miqdor yoki jami savollar sonidan kamrog'ini tasodifiy tanlash
-        count_to_pick = min(test.questions_count_to_show, len(all_questions))
-        selected_questions = random.sample(all_questions, count_to_pick)
-        # Savollar tartibini ham har bir o'quvchiga aralashtirib yuborish
-        random.shuffle(selected_questions)
-        
-        selected_q_ids = [q.id for q in selected_questions]
-
-        test_session = TestSession(
-            student_id=student.id, 
-            test_id=test_id, 
-            status="IN_PROGRESS",
-            selected_question_ids=json.dumps(selected_q_ids)
-        )
+        test_session = TestSession(student_id=student.id, test_id=test_id, status="IN_PROGRESS")
         session.add(test_session)
         await session.commit()
         await session.refresh(test_session)
 
-        await callback.message.edit_text(f"🚀 <b>{test.subject} ({test.title})</b> testi boshlandi!\nSizga {len(selected_questions)} ta savol tasodifiy taqdim etildi.")
+        await callback.message.edit_text(f"🚀 <b>{test.subject} ({test.title})</b> testi boshlandi!")
         user_id = callback.from_user.id
         await state.set_state(TestProcessState.in_test)
         
         total_duration_sec = test.duration_minutes * 60
         start_timestamp = datetime.now(timezone.utc)
         
-        for index, q in enumerate(selected_questions):
+        for index, q in enumerate(questions):
             current_test_check = await session.get(Test, test_id)
             if not current_test_check.is_active or current_test_check.is_finished:
                 break
@@ -748,7 +719,6 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
             if q.option_c: options.append(("C", q.option_c))
             if q.option_d: options.append(("D", q.option_d))
             
-            # Variantlarni ham o'quvchiga har xil qilish mumkin yoki shundoq qoldirish mumkin. Hozircha tartibini saqlaymiz.
             keyboard_buttons = []
             row = []
             for opt_key, text_val in options:
@@ -761,7 +731,7 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
             markup = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
             
             sec_title = f"<b>Fan / Bo'lim: {q.section_name}</b>\n" if q.section_name else ""
-            text_content = f"{sec_title}<b>Savol {index + 1} / {len(selected_questions)}</b> (Ball: {q.points})\n\n{q.question_text}"
+            text_content = f"{sec_title}<b>Savol {index + 1} / {len(questions)}</b> (Ball: {q.points})\n\n{q.question_text}"
             
             if q.photo_file_id:
                 q_msg = await bot.send_photo(chat_id=user_id, photo=q.photo_file_id, caption=text_content, reply_markup=markup)
@@ -853,9 +823,7 @@ async def save_answer(callback: CallbackQuery, bot: Bot):
     await callback.answer(f"Tanlandi: {selected}")
 
 async def calculate_and_save_results(session, sess: TestSession):
-    # Faqat o'quvchiga tushgan tanlangan savollar bo'yicha hisoblaymiz
-    q_ids = json.loads(sess.selected_question_ids) if sess.selected_question_ids else []
-    questions = (await session.execute(select(Question).where(Question.id.in_(q_ids)))).scalars().all()
+    questions = (await session.execute(select(Question).where(Question.test_id == sess.test_id))).scalars().all()
     answers = {a.question_id: a.selected_option for a in (await session.execute(select(Answer).where(Answer.session_id == sess.id))).scalars().all()}
     
     correct, wrong, unanswered, total_score = 0, 0, 0, 0.0
@@ -1083,11 +1051,7 @@ async def admin_session_question_analysis(callback: CallbackQuery):
         test = await session.get(Test, ts.test_id)
         student = await session.get(Student, ts.student_id)
         
-        q_ids = json.loads(ts.selected_question_ids) if ts.selected_question_ids else []
-        questions = (await session.execute(select(Question).where(Question.id.in_(q_ids)))).scalars().all()
-        q_dict = {q.id: q for q in questions}
-        ordered_questions = [q_dict[qid] for qid in q_ids if qid in q_dict]
-
+        questions = (await session.execute(select(Question).where(Question.test_id == test.id))).scalars().all()
         answers = {a.question_id: a.selected_option for a in (await session.execute(select(Answer).where(Answer.session_id == ts.id))).scalars().all()}
         
         text = f"📋 <b>{student.first_name} {student.last_name} ning test natijasi</b>\n" \
@@ -1095,7 +1059,7 @@ async def admin_session_question_analysis(callback: CallbackQuery):
                f"⭐ Ball: {ts.score} ({ts.score_percentage}%)\n" \
                f"✅ To'g'ri: {ts.correct_answers} | ❌ Noto'g'ri: {ts.wrong_answers} | ⭕ Javobsiz: {ts.unanswered}\n\n"
                
-        for idx, q in enumerate(ordered_questions, 1):
+        for idx, q in enumerate(questions, 1):
             sel = answers.get(q.id, "Javob berilmagan")
             status = "✅" if sel == q.correct_option else "❌"
             sec = f"[{q.section_name}] " if q.section_name else ""
@@ -1110,7 +1074,7 @@ async def admin_session_question_analysis(callback: CallbackQuery):
 @router.message(F.text == "ℹ️ Olimpiada haqida")
 async def about_handler(message: Message, state: FSMContext):
     if await state.get_state() == TestProcessState.in_test.state: return
-    await message.answer("ℹ️ Professional Olimpiada Tizimi v3.2 — Tasodifiy savollar va har bir o'quvchiga alohida variantlar.")
+    await message.answer("ℹ️ Professional Olimpiada Tizimi v3.1 — Har bir savol uchun vaqt sozlamasi va DTM blok testlar.")
 
 @router.message(Command("admin"))
 async def admin_panel(message: Message, state: FSMContext):
@@ -1208,8 +1172,8 @@ async def admin_get_grade(message: Message, state: FSMContext):
         await state.set_state(AdminAddTest.waiting_for_block_sub1)
         await message.answer("1-asosiy fanning nomini kiriting (masalan: Matematika yoki Fizika):")
     else:
-        await state.set_state(AdminAddTest.waiting_for_question_count)
-        await message.answer("🎯 O'quvchiga nechta savol tasodifiy tushishini kiriting (masalan: <code>30</code>):")
+        await state.set_state(AdminAddTest.waiting_for_question_time)
+        await message.answer("⏱ Har bir test (savol) uchun o'quvchiga beriladigan vaqtni **soniyada** kiriting (masalan: `45` yoki `60`):")
 
 @router.message(AdminAddTest.waiting_for_block_sub1)
 async def admin_get_block_sub1(message: Message, state: FSMContext):
@@ -1220,19 +1184,8 @@ async def admin_get_block_sub1(message: Message, state: FSMContext):
 @router.message(AdminAddTest.waiting_for_block_sub2)
 async def admin_get_block_sub2(message: Message, state: FSMContext):
     await state.update_data(block_sub2=message.text.strip())
-    await state.set_state(AdminAddTest.waiting_for_question_count)
-    await message.answer("🎯 O'quvchiga nechta savol tasodifiy tushishini kiriting (masalan: <code>75</code>):")
-
-@router.message(AdminAddTest.waiting_for_question_count)
-async def admin_get_question_count(message: Message, state: FSMContext):
-    try:
-        q_count = int(message.text.strip())
-        if q_count <= 0: q_count = 30
-    except:
-        q_count = 30
-    await state.update_data(questions_count_to_show=q_count)
     await state.set_state(AdminAddTest.waiting_for_question_time)
-    await message.answer("⏱ Har bir test (savol) uchun o'quvchiga beriladigan vaqtni **soniyada** kiriting (masalan: `45` yoki `60`):")
+    await message.answer("⏱ Har bir test (savol) uchun o'quvchiga beriladigan vaqtni **soniyada** kiriting (masalan: `60`):")
 
 @router.message(AdminAddTest.waiting_for_question_time)
 async def admin_get_question_time(message: Message, state: FSMContext):
@@ -1268,11 +1221,12 @@ async def admin_get_start_time(message: Message, state: FSMContext):
     data = await state.get_data()
     if data.get("is_block"):
         await message.answer(
-            "🧩 <b>Blok test uchun barcha savollarni yuboring (masalan, 100 ta yoki ko'proq):</b>\n\n"
+            "🧩 <b>Blok test uchun savollarni yuboring:</b>\n"
+            "Tartib bo'yicha: \n1) Tarix (10 ta)\n2) Ona tili (10 ta)\n3) Matematika (10 ta)\n4) 1-asosiy fan (30 ta)\n5) 2-asosiy fan (30 ta)\n\n"
             "Matn yoki Word/PDF fayl ko'rinishida yuborishingiz mumkin.", reply_markup=get_finish_test_keyboard()
         )
     else:
-        await message.answer("📂 Barcha savollarni matn yoki Word/PDF fayl ko'rinishida yuborishingiz mumkin (masalan, 100 ta savol).", reply_markup=get_finish_test_keyboard())
+        await message.answer("📂 Savollarni matn yoki Word/PDF fayl ko'rinishida yuborishingiz mumkin.", reply_markup=get_finish_test_keyboard())
 
 @router.message(AdminAddTest.waiting_for_questions, F.photo)
 async def admin_handle_photo_question(message: Message, state: FSMContext):
@@ -1287,7 +1241,7 @@ async def admin_handle_photo_question(message: Message, state: FSMContext):
         parsed["photo_file_id"] = photo_id
         q_list.append(parsed)
         await state.update_data(questions=q_list)
-        await message.answer(f"📸 Rasmli savol qo'shildi! Jami yuklangan savollar: {len(q_list)}")
+        await message.answer(f"📸 Rasmli savol qo'shildi! Jami savollar: {len(q_list)}")
     else:
         await message.answer("❌ Rasm tagiga savol va variantlarni (A, B, C, D) to'g'ri formatda yozing!")
 
@@ -1316,7 +1270,7 @@ async def admin_handle_document(message: Message, state: FSMContext, bot: Bot):
         
     added = await parse_and_add_questions(extracted_text, state)
     data = await state.get_data()
-    await message.answer(f"✅ Fayldan {added} ta savol qo'shildi! Jami yuklangan: {len(data.get('questions', []))}")
+    await message.answer(f"✅ Fayldan {added} ta savol qo'shildi! Jami: {len(data.get('questions', []))}")
 
 @router.message(AdminAddTest.waiting_for_questions, F.text == "✅ Testni yakunlash va saqlash")
 async def admin_ask_for_answers(message: Message, state: FSMContext):
@@ -1326,14 +1280,14 @@ async def admin_ask_for_answers(message: Message, state: FSMContext):
         await message.answer("❌ Savollar mavjud emas!")
         return
     await state.set_state(AdminAddTest.waiting_for_answers)
-    await message.answer(f"🔑 Jami {len(data.get('questions'))} ta savol uchun to'g'ri javoblarni ketma-ketlikda yuboring (masalan: `A B C D A...`):", reply_markup=get_admin_menu())
+    await message.answer("🔑 To'g'ri javoblarni ketma-ketlikda yuboring (masalan: `A B C D A...`):", reply_markup=get_admin_menu())
 
 @router.message(AdminAddTest.waiting_for_questions, F.text)
 async def admin_add_bulk_questions_text(message: Message, state: FSMContext):
     if not await is_admin(message.from_user.id): return
     added = await parse_and_add_questions(message.text, state)
     data = await state.get_data()
-    await message.answer(f"✅ {added} ta savol qo'shildi! Jami yuklangan: {len(data.get('questions', []))}")
+    await message.answer(f"✅ {added} ta savol qo'shildi! Jami: {len(data.get('questions', []))}")
 
 def parse_single_question_text(text: str) -> dict:
     lines = [l.strip() for l in text.split("\n") if l.strip()]
@@ -1411,7 +1365,6 @@ async def admin_save_answers_and_test(message: Message, state: FSMContext):
             mode="global_timer",
             duration_minutes=180 if is_block else data.get("duration_minutes", 60),
             question_time_seconds=data.get("question_time_seconds", 60),
-            questions_count_to_show=data.get("questions_count_to_show", 30),
             is_block_test=is_block,
             block_subjects=json.dumps({"sub1": data.get("block_sub1"), "sub2": data.get("block_sub2")}) if is_block else None,
             start_time=data.get("start_time"),
@@ -1459,7 +1412,7 @@ async def admin_save_answers_and_test(message: Message, state: FSMContext):
                 
         await session.commit()
     await state.clear()
-    await message.answer("✅ Test muvaffaqiyatli saqlandi! Har bir o'quvchiga savollar tasodifiy va belgilingan miqdorda tarqatiladi.", reply_markup=get_admin_menu())
+    await message.answer("✅ Test muvaffaqiyatli saqlandi va har bir savol uchun vaqt belgilandi!", reply_markup=get_admin_menu())
 
 @router.message(F.text == "⚙️ Testlarni boshqarish")
 async def manage_tests_admin(message: Message):
@@ -1611,8 +1564,7 @@ async def accept_appeal(callback: CallbackQuery, bot: Bot):
         ts.score += 1.0
         ts.correct_answers += 1
         
-        q_ids = json.loads(ts.selected_question_ids) if ts.selected_question_ids else []
-        questions_count = len(q_ids)
+        questions_count = await session.scalar(select(func.count(Question.id)).where(Question.test_id == ts.test_id))
         if questions_count > 0:
             ts.score_percentage = round((ts.score / questions_count) * 100, 2)
             
@@ -1721,6 +1673,7 @@ async def save_new_admin(message: Message, state: FSMContext):
     try:
         tg_id = int(message.text.strip())
         async with async_session() as session:
+            # Takroran qo'shilishining oldini olish
             existing = (await session.execute(select(Admin).where(Admin.telegram_id == tg_id))).scalar_one_or_none()
             if existing:
                 await message.answer("⚠️ Bu foydalanuvchi allaqachon admin ro'yxatida mavjud!", reply_markup=get_admin_menu())
@@ -1810,6 +1763,41 @@ async def reminder_scheduler(bot: Bot):
             now = datetime.now(timezone.utc)
             reminder_target_time = now + timedelta(minutes=15)
             async with async_session() as session:
-                pass
-        except Exception:
-            pass
+                reminders = (await session.execute(
+                    select(Reminder, Test, Student)
+                    .join(Test, Reminder.test_id == Test.id)
+                    .join(Student, Reminder.student_id == Student.id)
+                    .where(Reminder.reminded == False)
+                )).all()
+                
+                for rem, t, st in reminders:
+                    if t.start_time:
+                        start_t = t.start_time.replace(tzinfo=timezone.utc) if t.start_time.tzinfo is None else t.start_time
+                        if now < start_t <= reminder_target_time:
+                            if st.telegram_id:
+                                try:
+                                    await bot.send_message(
+                                        chat_id=st.telegram_id,
+                                        text=f"🔔 <b>Eslatma!</b>\n\nSiz ro'yxatdan o'tgan <b>{t.subject} ({t.title})</b> testi 15 daqiqadan so'ng boshlanadi."
+                                    )
+                                except: pass
+                            rem.reminded = True
+                await session.commit()
+        except Exception as e:
+            logging.error(f"Reminder error: {e}")
+
+async def main():
+    logging.basicConfig(level=logging.INFO, stream=sys.stdout)
+    await init_db()
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(router)
+    await bot.delete_webhook(drop_pending_updates=True)
+    
+    asyncio.create_task(reminder_scheduler(bot))
+    
+    logging.info("🚀 Bot ishga tushdi!")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
