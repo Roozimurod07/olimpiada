@@ -39,7 +39,7 @@ from google.oauth2.service_account import Credentials
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON")
 SHEET_NAME = "Olimpiada"
-REQUIRED_CHANNEL = "@diamir_edu"
+REQUIRED_CHANNEL = "@olimpiada01111"
 
 # O'z Telegram ID raqamingizni shu yerga yozing!
 SUPER_ADMIN_IDS = [8317043750]
@@ -818,9 +818,43 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
             await callback.answer("Bu testda savollar yo'q!", show_alert=True)
             return
 
-        count_to_pick = min(test.questions_count_to_show or 30, len(all_questions))
-        selected_questions = random.sample(all_questions, count_to_pick)
-        random.shuffle(selected_questions)
+        if test.is_block_test:
+            # Blok testda aynan 10/10/10/30/30 tarkib olinadi.
+            names = json.loads(test.block_subjects or "{}")
+            sub1 = names.get("sub1") or "Asosiy fan 1"
+            sub2 = names.get("sub2") or "Asosiy fan 2"
+            grouped_questions = {
+                "Tarix": [], "Ona tili": [], "Matematika": [],
+                "Asosiy fan 1": [], "Asosiy fan 2": []
+            }
+            for q in all_questions:
+                if q.section_name == sub1:
+                    grouped_questions["Asosiy fan 1"].append(q)
+                elif q.section_name == sub2:
+                    grouped_questions["Asosiy fan 2"].append(q)
+                elif q.section_name in grouped_questions:
+                    grouped_questions[q.section_name].append(q)
+
+            if any(len(grouped_questions[k]) != BLOCK_COUNTS[k] for k in BLOCK_SECTIONS):
+                await callback.answer("❌ Blok test bazasida 10/10/10/30/30 tarkib yo'q.", show_alert=True)
+                return
+
+            # Har bir fandan aynan kerakli savollar olinadi.
+            selected_questions = []
+            for sec in BLOCK_SECTIONS:
+                selected_questions.extend(grouped_questions[sec])
+            # Faqat fan ichida aralashtiramiz; fanlar o'rtasida aralashtirmaymiz.
+            for sec in BLOCK_SECTIONS:
+                start = sum(BLOCK_COUNTS[x] for x in BLOCK_SECTIONS[:BLOCK_SECTIONS.index(sec)])
+                end = start + BLOCK_COUNTS[sec]
+                part = selected_questions[start:end]
+                random.shuffle(part)
+                selected_questions[start:end] = part
+        else:
+            count_to_pick = min(test.questions_count_to_show or 30, len(all_questions))
+            selected_questions = random.sample(all_questions, count_to_pick)
+            random.shuffle(selected_questions)
+
         selected_q_ids = [q.id for q in selected_questions]
 
         test_session = TestSession(
@@ -847,13 +881,8 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
                 else: key=sec
                 if key in grouped:
                     grouped[key].append(q.id)
-            if any(len(grouped[k]) != BLOCK_COUNTS[k] for k in BLOCK_SECTIONS):
-                test_session.status="COMPLETED"
-                test_session.finished_at=now
-                await session.commit()
-                await callback.answer("❌ Blok test bazasida 10/10/10/30/30 tarkib yo'q.", show_alert=True)
-                return
-            block_question_order[test_session.id]=grouped
+            # Savollar oldindan 10/10/10/30/30 tartibida tanlangan.
+            block_question_order[test_session.id] = grouped
             block_current_section[test_session.id]=None
             await state.set_state(TestProcessState.in_test)
             await callback.message.edit_text(
@@ -1737,63 +1766,189 @@ async def admin_add_bulk_questions_text(message: Message, state: FSMContext):
     data = await state.get_data()
     await message.answer(f"✅ {added} ta savol qo'shildi! Jami yuklangan: {len(data.get('questions', []))}")
 
-def parse_single_question_text(text: str) -> dict:
-    lines = [l.strip() for l in text.split("\n") if l.strip()]
-    a_idx, b_idx, c_idx, d_idx = -1, -1, -1, -1
-    for j in range(len(lines)):
-        l = lines[j].lower()
-        if l.startswith("a)") or l.startswith("a."): a_idx = j
-        elif l.startswith("b)") or l.startswith("b."): b_idx = j
-        elif l.startswith("c)") or l.startswith("c."): c_idx = j
-        elif l.startswith("d)") or l.startswith("d."): d_idx = j
+def _clean_question_number(text: str) -> str:
+    return re.sub(r"^\s*\d+\s*[\.\):-]\s*", "", text.strip())
 
-    if a_idx != -1 and b_idx != -1:
-        q_text = " ".join(lines[:a_idx])
-        return {
-            "text": q_text, 
-            "a": re.sub(r'^[aA][\.\)]\s*', '', lines[a_idx]), 
-            "b": re.sub(r'^[bB][\.\)]\s*', '', lines[b_idx]),
-            "c": re.sub(r'^[cC][\.\)]\s*', '', lines[c_idx]) if c_idx != -1 else "C",
-            "d": re.sub(r'^[dD][\.\)]\s*', '', lines[d_idx]) if d_idx != -1 else "D",
-            "correct": "A",
-            "photo_file_id": None
-        }
-    return None
+
+def _parse_question_block(block: str) -> dict | None:
+    """
+    Parse one complete question block. Variant markers must be at the
+    beginning of a line, so letters inside normal text never become options.
+    """
+    lines = [line.strip() for line in block.replace("\r", "").split("\n") if line.strip()]
+    if not lines:
+        return None
+
+    option_positions = {}
+    for idx, line in enumerate(lines):
+        m = re.match(r"^([A-Da-d])[\.\)]\s*(.*)$", line)
+        if m and m.group(1).upper() not in option_positions:
+            option_positions[m.group(1).upper()] = (idx, m.group(2).strip())
+
+    if "A" not in option_positions or "B" not in option_positions:
+        return None
+
+    a_idx = option_positions["A"][0]
+    b_idx = option_positions["B"][0]
+    c_idx = option_positions.get("C", (None, "C"))[0]
+    d_idx = option_positions.get("D", (None, "D"))[0]
+
+    positions = [a_idx, b_idx]
+    if c_idx is not None:
+        positions.append(c_idx)
+    if d_idx is not None:
+        positions.append(d_idx)
+
+    if positions != sorted(positions):
+        return None
+
+    question_text = " ".join(_clean_question_number(x) for x in lines[:a_idx]).strip()
+    if not question_text:
+        return None
+
+    return {
+        "text": question_text,
+        "a": option_positions["A"][1] or "A",
+        "b": option_positions["B"][1] or "B",
+        "c": option_positions.get("C", (None, "C"))[1] or "C",
+        "d": option_positions.get("D", (None, "D"))[1] or "D",
+        "correct": "A",
+        "photo_file_id": None,
+    }
+
+
+def parse_single_question_text(text: str) -> dict | None:
+    return _parse_question_block(text)
+
+
+def _split_question_blocks(text: str) -> list[str]:
+    """
+    Supports both:
+      1. Question...
+      A) ...
+      B) ...
+      C) ...
+      D) ...
+
+    and the same format without question numbers.
+
+    The important difference from the old parser is that it does NOT assume
+    A/B/C/D must appear within the next 8 lines. Long questions and multi-line
+    questions therefore remain intact.
+    """
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not normalized:
+        return []
+
+    lines = normalized.split("\n")
+
+    # First try numbered questions. This is the safest format for bulk uploads.
+    number_positions = [
+        idx for idx, line in enumerate(lines)
+        if re.match(r"^\s*\d+\s*[\.\):-]\s*", line)
+    ]
+
+    blocks = []
+    if len(number_positions) >= 2:
+        for pos, next_pos in zip(number_positions, number_positions[1:] + [len(lines)]):
+            block = "\n".join(lines[pos:next_pos]).strip()
+            if block:
+                blocks.append(block)
+        # If numbered parsing produced valid question blocks, use them.
+        if sum(1 for b in blocks if _parse_question_block(b)) > 0:
+            return blocks
+
+    # Unnumbered format: each question begins after the previous D/C/B option.
+    # We identify every A) marker and use the text since the previous option block.
+    a_positions = [
+        idx for idx, line in enumerate(lines)
+        if re.match(r"^\s*[Aa][\.\)]\s*", line)
+    ]
+
+    if not a_positions:
+        return [normalized]
+
+    # Locate the end of each question by finding D) after its A).
+    for idx, a_pos in enumerate(a_positions):
+        # The next A) is a hard boundary if D) was omitted.
+        end_limit = a_positions[idx + 1] if idx + 1 < len(a_positions) else len(lines)
+        d_pos = None
+        for j in range(a_pos + 1, end_limit):
+            if re.match(r"^\s*[Dd][\.\)]\s*", lines[j]):
+                d_pos = j
+                break
+        end = d_pos + 1 if d_pos is not None else end_limit
+
+        # Find where this question's text starts: after the previous D).
+        start = 0
+        if idx > 0:
+            prev_a = a_positions[idx - 1]
+            prev_d = None
+            for j in range(prev_a + 1, a_pos):
+                if re.match(r"^\s*[Dd][\.\)]\s*", lines[j]):
+                    prev_d = j
+                    break
+            if prev_d is not None:
+                start = prev_d + 1
+            else:
+                start = a_pos - 1 if a_pos > 0 else 0
+
+        block = "\n".join(lines[start:end]).strip()
+        if block:
+            blocks.append(block)
+
+    return blocks
+
 
 async def parse_and_add_questions(text: str, state: FSMContext) -> int:
-    data=await state.get_data()
-    questions_list=data.get("questions",[])
-    lines=[line.strip() for line in text.split("\n") if line.strip()]
-    section=data.get("current_block_section") if data.get("is_block") else None
+    """
+    Bulk question importer.
+
+    Old behavior:
+      - only searched the next 8 lines for A/B/C/D;
+      - could silently stop after 7 questions;
+      - could merge one question's variants into another.
+
+    New behavior:
+      - detects complete question blocks;
+      - accepts long/multi-line question text;
+      - keeps A/B/C/D attached to the correct question;
+      - enforces the exact block-test section limit.
+    """
+    data = await state.get_data()
+    questions_list = list(data.get("questions", []))
+
+    section = data.get("current_block_section") if data.get("is_block") else None
     if data.get("is_block") and not section:
         return 0
-    existing=sum(1 for q in questions_list if q.get("block_section")==section) if section else 0
-    limit=BLOCK_COUNTS.get(section,10**9)
-    added=0
-    i=0
-    while i<len(lines):
-        a_idx=b_idx=c_idx=d_idx=-1
-        for j in range(i+1,min(i+8,len(lines))):
-            low=lines[j].lower()
-            if low.startswith("a)") or low.startswith("a."): a_idx=j
-            elif low.startswith("b)") or low.startswith("b."): b_idx=j
-            elif low.startswith("c)") or low.startswith("c."): c_idx=j
-            elif low.startswith("d)") or low.startswith("d."): d_idx=j
-        if a_idx!=-1 and b_idx!=-1:
-            if existing+added>=limit: break
-            questions_list.append({
-                "text":" ".join(lines[i:a_idx]),
-                "a":re.sub(r'^[aA][\.\)]\s*','',lines[a_idx]),
-                "b":re.sub(r'^[bB][\.\)]\s*','',lines[b_idx]),
-                "c":re.sub(r'^[cC][\.\)]\s*','',lines[c_idx]) if c_idx!=-1 else "C",
-                "d":re.sub(r'^[dD][\.\)]\s*','',lines[d_idx]) if d_idx!=-1 else "D",
-                "correct":"A","photo_file_id":None,
-                "block_section":section
-            })
-            added+=1
-            i=max(a_idx,b_idx,c_idx,d_idx)+1
-        else:
-            i+=1
+
+    if section:
+        existing = sum(1 for q in questions_list if q.get("block_section") == section)
+        limit = BLOCK_COUNTS.get(section, 0)
+    else:
+        existing = len(questions_list)
+        limit = 10**9
+
+    if existing >= limit:
+        return 0
+
+    added = 0
+    blocks = _split_question_blocks(text)
+
+    for block in blocks:
+        if existing + added >= limit:
+            break
+
+        parsed = _parse_question_block(block)
+        if not parsed:
+            continue
+
+        if data.get("is_block"):
+            parsed["block_section"] = section
+
+        questions_list.append(parsed)
+        added += 1
+
     await state.update_data(questions=questions_list)
     return added
 
@@ -1801,14 +1956,23 @@ async def parse_and_add_questions(text: str, state: FSMContext) -> int:
 @router.message(AdminAddTest.waiting_for_answers)
 async def admin_save_answers_and_test(message: Message, state: FSMContext):
     if not await is_admin(message.from_user.id): return
-    tokens = re.findall(r'[A-D]', message.text.upper())
+    tokens = [x.upper() for x in re.findall(r'(?<![A-Z])([A-D])(?![A-Z])', message.text.upper())]
     data = await state.get_data()
     questions_list = data.get("questions", [])
     
-    for idx, q in enumerate(questions_list):
-        if idx < len(tokens): q["correct"] = tokens[idx]
-
     is_block = data.get("is_block", False)
+    expected = len(questions_list)
+
+    if len(tokens) != expected:
+        await message.answer(
+            f"❌ Javoblar soni noto'g'ri! {expected} ta savol bor, "
+            f"lekin {len(tokens)} ta javob yuborildi.\n\n"
+            "Faqat A, B, C, D harflarini tartib bilan yuboring."
+        )
+        return
+
+    for idx, q in enumerate(questions_list):
+        q["correct"] = tokens[idx]
     
     async with async_session() as session:
         new_test = Test(
