@@ -734,21 +734,21 @@ async def start_block_test_prompt(message: Message, state: FSMContext):
 
     async with async_session() as session:
         student = (await session.execute(select(Student).where(Student.telegram_id == message.from_user.id))).scalar_one_or_none()
-        if not student or not student.grade:
-            await message.answer("❌ Profilingizda sinf ko'rsatilmagan yoki ro'yxatdan o'tmagansiz.")
+        if not student:
+            await message.answer("❌ Ro'yxatdan o'tmagansiz.")
             return
 
+        # Blok test barcha sinflar uchun umumiy.
         tests = (await session.execute(
             select(Test).where(
-                Test.is_active == True, 
-                Test.is_finished == False, 
-                Test.grade_level == student.grade,
+                Test.is_active == True,
+                Test.is_finished == False,
                 Test.is_block_test == True
             )
         )).scalars().all()
         
         if not tests:
-            await message.answer(f"⚠️ Hozirda <b>{student.grade}</b> uchun faol blok testlar mavjud emas.")
+            await message.answer("⚠️ Hozirda faol blok testlar mavjud emas.")
             return
 
         keyboard_buttons = [[InlineKeyboardButton(text=f"🧩 {t.subject} — {t.title}", callback_data=f"start_test_{t.id}")] for t in tests]
@@ -1501,8 +1501,23 @@ async def admin_get_title(message: Message, state: FSMContext):
     await state.update_data(title=message.text.strip())
     data = await state.get_data()
     if data.get("is_block"):
-        await state.set_state(AdminAddTest.waiting_for_grade)
-        await message.answer("Sinfni kiriting (masalan: `11-sinf`):")
+        # BLOK TEST: sinf umuman ishlatilmaydi.
+        # U barcha o'quvchilar uchun umumiy bo'ladi.
+        await state.update_data(
+            subject="Blok Test",
+            grade="ALL",
+            questions_count_to_show=90,
+            duration_minutes=180,
+            question_time_seconds=None,
+        )
+        await state.set_state(AdminAddTest.waiting_for_block_sub1)
+        await message.answer(
+            "🧩 <b>Blok test barcha sinflar uchun umumiy.</b>\n\n"
+            "❌ Sinf so'ralmaydi.\n"
+            "⏱ Umumiy vaqt: <b>180 daqiqa</b>.\n"
+            "🔢 Jami: <b>90 ta savol</b>.\n\n"
+            "📘 1-asosiy fanning nomini kiriting:"
+        )
     else:
         await state.set_state(AdminAddTest.waiting_for_subject)
         await message.answer("Fan nomini kiriting:")
@@ -1515,12 +1530,15 @@ async def admin_get_subject(message: Message, state: FSMContext):
 
 @router.message(AdminAddTest.waiting_for_grade)
 async def admin_get_grade(message: Message, state: FSMContext):
-    await state.update_data(grade=message.text.strip())
     data = await state.get_data()
     if data.get("is_block"):
+        # Himoya: blok test bu state'ga hech qachon sinf so'ramasdan o'tishi kerak.
+        await state.update_data(grade="ALL", subject="Blok Test", duration_minutes=180, question_time_seconds=None)
         await state.set_state(AdminAddTest.waiting_for_block_sub1)
-        await message.answer("1-asosiy fanning nomini kiriting (masalan: Matematika yoki Fizika):")
-    else:
+        await message.answer("🧩 Blok test barcha sinflar uchun umumiy.\n\n📘 1-asosiy fanning nomini kiriting:")
+        return
+    await state.update_data(grade=message.text.strip())
+    if not data.get("is_block"):
         await state.set_state(AdminAddTest.waiting_for_question_count)
         await message.answer("🎯 O'quvchiga nechta savol tasodifiy tushishini kiriting (masalan: <code>30</code>):")
 
@@ -1533,8 +1551,14 @@ async def admin_get_block_sub1(message: Message, state: FSMContext):
 @router.message(AdminAddTest.waiting_for_block_sub2)
 async def admin_get_block_sub2(message: Message, state: FSMContext):
     await state.update_data(block_sub2=message.text.strip())
-    await state.set_state(AdminAddTest.waiting_for_question_count)
-    await message.answer("🎯 O'quvchiga nechta savol tasodifiy tushishini kiriting (masalan: <code>75</code>):")
+    # Blok testda savollar soni qat'iy 90 ta, vaqt esa umumiy 180 daqiqa.
+    await state.update_data(
+        questions_count_to_show=90,
+        question_time_seconds=None,
+        duration_minutes=180
+    )
+    await state.set_state(AdminAddTest.waiting_for_attempts)
+    await message.answer("🔢 Maksimal urinishlar sonini kiriting (masalan: 1):")
 
 @router.message(AdminAddTest.waiting_for_question_count)
 async def admin_get_question_count(message: Message, state: FSMContext):
@@ -1790,11 +1814,11 @@ async def admin_save_answers_and_test(message: Message, state: FSMContext):
         new_test = Test(
             title=data["title"], 
             subject="Blok Test" if is_block else data["subject"], 
-            grade_level=data["grade"],
+            grade_level="ALL" if is_block else data["grade"],
             max_attempts=data["max_attempts"], 
             mode="global_timer",
             duration_minutes=180 if is_block else data.get("duration_minutes", 60),
-            question_time_seconds=data.get("question_time_seconds", 60),
+            question_time_seconds=None if is_block else data.get("question_time_seconds", 60),
             questions_count_to_show=90 if is_block else data.get("questions_count_to_show", 30),
             is_block_test=is_block,
             block_subjects=json.dumps({"sub1": data.get("block_sub1"), "sub2": data.get("block_sub2")}) if is_block else None,
@@ -1833,7 +1857,10 @@ async def admin_save_answers_and_test(message: Message, state: FSMContext):
             ))
             
         if data.get("start_time"):
-            students = (await session.execute(select(Student).where(Student.grade == data["grade"], Student.telegram_id.is_not(None)))).scalars().all()
+            student_query = select(Student).where(Student.telegram_id.is_not(None))
+            if not is_block:
+                student_query = student_query.where(Student.grade == data["grade"])
+            students = (await session.execute(student_query)).scalars().all()
             for st in students:
                 session.add(Reminder(test_id=new_test.id, student_id=st.id, reminded=False))
                 
