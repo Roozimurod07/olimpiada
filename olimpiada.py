@@ -380,6 +380,35 @@ class TestProcessState(StatesGroup):
 
 router = Router()
 
+# Blok testning qat'iy tarkibi
+BLOCK_SECTIONS = ["Tarix", "Ona tili", "Matematika", "Asosiy fan 1", "Asosiy fan 2"]
+BLOCK_COUNTS = {"Tarix": 10, "Ona tili": 10, "Matematika": 10, "Asosiy fan 1": 30, "Asosiy fan 2": 30}
+BLOCK_POINTS = {"Tarix": 1.1, "Ona tili": 1.1, "Matematika": 1.1, "Asosiy fan 1": 3.1, "Asosiy fan 2": 2.1}
+
+# Blok test runtime holati: fan tanlovi va navbatdagi savol.
+block_question_order = {}
+block_current_section = {}
+
+def get_student_block_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📜 Tarix (10)", callback_data="student_block_sec_Tarix")],
+        [InlineKeyboardButton(text="📝 Ona tili (10)", callback_data="student_block_sec_Ona_tili")],
+        [InlineKeyboardButton(text="➗ Matematika (10)", callback_data="student_block_sec_Matematika")],
+        [InlineKeyboardButton(text="📘 Asosiy fan 1 (30)", callback_data="student_block_sec_Main1")],
+        [InlineKeyboardButton(text="📗 Asosiy fan 2 (30)", callback_data="student_block_sec_Main2")],
+        [InlineKeyboardButton(text="🏁 Testni yakunlash", callback_data="student_block_finish")],
+    ])
+
+def get_block_section_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📜 Tarix — 10", callback_data="admin_block_sec_Tarix")],
+        [InlineKeyboardButton(text="📝 Ona tili — 10", callback_data="admin_block_sec_Ona_tili")],
+        [InlineKeyboardButton(text="➗ Matematika — 10", callback_data="admin_block_sec_Matematika")],
+        [InlineKeyboardButton(text="📘 Asosiy fan 1 — 30", callback_data="admin_block_sec_Main1")],
+        [InlineKeyboardButton(text="📗 Asosiy fan 2 — 30", callback_data="admin_block_sec_Main2")],
+        [InlineKeyboardButton(text="🏁 Savollarni tugatish", callback_data="admin_block_finish")],
+    ])
+
 async def get_main_menu_keyboard():
     keyboard = [
         [KeyboardButton(text="📝 Testni boshlash")]
@@ -805,6 +834,37 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
         await session.commit()
         await session.refresh(test_session)
 
+        if test.is_block_test:
+            # Savollarni 10/10/10/30/30 bo'yicha guruhlaymiz.
+            names=json.loads(test.block_subjects or "{}")
+            sub1=names.get("sub1") or "Asosiy fan 1"
+            sub2=names.get("sub2") or "Asosiy fan 2"
+            grouped={"Tarix":[],"Ona tili":[],"Matematika":[],"Asosiy fan 1":[],"Asosiy fan 2":[]}
+            for q in all_questions:
+                sec=q.section_name
+                if sec==sub1: key="Asosiy fan 1"
+                elif sec==sub2: key="Asosiy fan 2"
+                else: key=sec
+                if key in grouped:
+                    grouped[key].append(q.id)
+            if any(len(grouped[k]) != BLOCK_COUNTS[k] for k in BLOCK_SECTIONS):
+                test_session.status="COMPLETED"
+                test_session.finished_at=now
+                await session.commit()
+                await callback.answer("❌ Blok test bazasida 10/10/10/30/30 tarkib yo'q.", show_alert=True)
+                return
+            block_question_order[test_session.id]=grouped
+            block_current_section[test_session.id]=None
+            await state.set_state(TestProcessState.in_test)
+            await callback.message.edit_text(
+                "🧩 <b>Blok test boshlandi!</b>\n\n"
+                "⏱ <b>180 daqiqa</b> — barcha 90 ta savol uchun umumiy vaqt.\n"
+                "Istalgan fandan boshlashingiz mumkin.\n\n"
+                "📚 Fan tanlang:",
+                reply_markup=get_student_block_keyboard()
+            )
+            return
+
         # Keyingi kod DB sessiondan tashqarida ishlaydi.
         subject = test.subject
         title = test.title
@@ -966,6 +1026,75 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
         active_question_by_session.pop(test_session.id, None)
         answer_events.pop(test_session.id, None)
 
+async def show_block_question(session_id:int, user_id:int, section:str, bot:Bot):
+    async with async_session() as session:
+        ts=await session.get(TestSession,session_id)
+        if not ts or ts.status!="IN_PROGRESS": return
+        started=ts.started_at.replace(tzinfo=timezone.utc) if ts.started_at.tzinfo is None else ts.started_at
+        remaining=180*60-(datetime.now(timezone.utc)-started).total_seconds()
+        if remaining<=0:
+            ts.status="COMPLETED"; ts.finished_at=datetime.now(timezone.utc)
+            await calculate_and_save_results(session,ts); await session.commit()
+            block_question_order.pop(session_id,None); block_current_section.pop(session_id,None)
+            await bot.send_message(user_id,"⏰ 180 daqiqalik umumiy vaqt tugadi.")
+            return
+        qids=block_question_order.get(session_id,{}).get(section,[])
+        answered={a.question_id for a in (await session.execute(select(Answer).where(Answer.session_id==session_id))).scalars().all()}
+        qid=next((x for x in qids if x not in answered),None)
+        if qid is None:
+            await bot.send_message(user_id,f"✅ {section} bo'limi tugadi.",reply_markup=get_student_block_keyboard())
+            return
+        q=await session.get(Question,qid)
+    block_current_section[session_id]=section
+    active_question_by_session[session_id]=qid
+    rem=max(0,int(remaining))
+    h,rem2=divmod(rem,3600); m,sec=divmod(rem2,60)
+    opts=[("A",q.option_a),("B",q.option_b),("C",q.option_c),("D",q.option_d)]
+    opts=[x for x in opts if x[1]]
+    kb=[[InlineKeyboardButton(text=f"{k}) {v}",callback_data=f"ans_{session_id}_{q.id}_{k}")] for k,v in opts]
+    kb.append([InlineKeyboardButton(text="📚 Fanlar",callback_data=f"student_block_menu_{session_id}")])
+    text=f"🧩 <b>{section}</b>\n⏱ Qolgan vaqt: <b>{h:02d}:{m:02d}:{sec:02d}</b>\n\n<b>Savol</b>\n{q.question_text}"
+    if q.photo_file_id:
+        await bot.send_photo(user_id,q.photo_file_id,caption=text,reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    else:
+        await bot.send_message(user_id,text,reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+@router.callback_query(F.data.startswith("student_block_sec_"))
+async def student_choose_block_section(callback:CallbackQuery, bot:Bot):
+    key=callback.data[len("student_block_sec_"):]
+    section={"Tarix":"Tarix","Ona_tili":"Ona tili","Matematika":"Matematika","Main1":"Asosiy fan 1","Main2":"Asosiy fan 2"}.get(key)
+    if not section: return
+    async with async_session() as session:
+        student=(await session.execute(select(Student).where(Student.telegram_id==callback.from_user.id))).scalar_one_or_none()
+        if not student: return
+        ts=(await session.execute(select(TestSession).where(TestSession.student_id==student.id,TestSession.status=="IN_PROGRESS").order_by(TestSession.id.desc()))).scalars().first()
+        if not ts or ts.id not in block_question_order:
+            await callback.answer("Faol blok test topilmadi.",show_alert=True); return
+        session_id=ts.id
+    await callback.answer()
+    await callback.message.delete()
+    await show_block_question(session_id,callback.from_user.id,section,bot)
+
+@router.callback_query(F.data.startswith("student_block_menu_"))
+async def student_block_menu(callback:CallbackQuery):
+    await callback.message.edit_text("📚 <b>Istalgan fandan davom eting:</b>",reply_markup=get_student_block_keyboard())
+    await callback.answer()
+
+@router.callback_query(F.data=="student_block_finish")
+async def student_block_finish(callback:CallbackQuery, bot:Bot):
+    async with async_session() as session:
+        student=(await session.execute(select(Student).where(Student.telegram_id==callback.from_user.id))).scalar_one_or_none()
+        if not student: return
+        ts=(await session.execute(select(TestSession).where(TestSession.student_id==student.id,TestSession.status=="IN_PROGRESS").order_by(TestSession.id.desc()))).scalars().first()
+        if not ts or ts.id not in block_question_order:
+            await callback.answer("Faol blok test topilmadi.",show_alert=True); return
+        ts.status="COMPLETED"; ts.finished_at=datetime.now(timezone.utc)
+        await calculate_and_save_results(session,ts); await session.commit()
+        result=f"🏆 <b>Blok test yakunlandi!</b>\n\nNatijangiz: <b>{ts.score} ball ({ts.score_percentage}%)</b>"
+    block_question_order.pop(ts.id,None); block_current_section.pop(ts.id,None); active_question_by_session.pop(ts.id,None)
+    await callback.message.edit_text(result)
+    await callback.answer()
+
 @router.callback_query(F.data.startswith("ans_"))
 async def save_answer(callback: CallbackQuery, bot: Bot):
     try:
@@ -973,6 +1102,30 @@ async def save_answer(callback: CallbackQuery, bot: Bot):
         session_id, question_id, selected = int(parts[1]), int(parts[2]), parts[3].upper()
     except (ValueError, IndexError):
         await callback.answer("❌ Javob tugmasi noto'g'ri.", show_alert=True)
+        return
+
+    if session_id in block_question_order:
+        async with async_session() as session:
+            ts=await session.get(TestSession,session_id)
+            if not ts or ts.status!="IN_PROGRESS":
+                await callback.answer("⏰ Test sessiyasi faol emas.",show_alert=True); return
+            student=await session.get(Student,ts.student_id)
+            if not student or student.telegram_id!=callback.from_user.id:
+                await callback.answer("❌ Bu savol sizga tegishli emas.",show_alert=True); return
+            if active_question_by_session.get(session_id)!=question_id:
+                await callback.answer("⚠️ Bu savol faol emas.",show_alert=True); return
+            q=await session.get(Question,question_id)
+            if not q or q.test_id!=ts.test_id:
+                await callback.answer("❌ Savol topilmadi.",show_alert=True); return
+            existing=(await session.execute(select(Answer).where(Answer.session_id==session_id,Answer.question_id==question_id))).scalar_one_or_none()
+            if existing: existing.selected_option=selected
+            else: session.add(Answer(session_id=session_id,question_id=question_id,selected_option=selected))
+            await session.commit()
+        section=block_current_section.get(session_id)
+        active_question_by_session.pop(session_id,None)
+        await callback.answer(f"Tanlandi: {selected}")
+        await callback.message.delete()
+        await show_block_question(session_id,callback.from_user.id,section,bot)
         return
 
     event_to_wake = None
@@ -1428,11 +1581,60 @@ async def admin_get_start_time(message: Message, state: FSMContext):
     data = await state.get_data()
     if data.get("is_block"):
         await message.answer(
-            "🧩 <b>Blok test uchun barcha savollarni yuboring (masalan, 100 ta yoki ko'proq):</b>\n\n"
-            "Matn yoki Word/PDF fayl ko'rinishida yuborishingiz mumkin.", reply_markup=get_finish_test_keyboard()
+            "🧩 <b>Blok test savollarini fanlar bo'yicha alohida yuklang.</b>\n\n"
+            "📜 Tarix — 10 ta\n📝 Ona tili — 10 ta\n➗ Matematika — 10 ta\n"
+            "📘 Asosiy fan 1 — 30 ta\n📗 Asosiy fan 2 — 30 ta\n\n"
+            "Avval fan tugmasini bosing, keyin shu fanning savollarini yuboring.",
+            reply_markup=get_block_section_keyboard()
         )
     else:
         await message.answer("📂 Barcha savollarni matn yoki Word/PDF fayl ko'rinishida yuborishingiz mumkin (masalan, 100 ta savol).", reply_markup=get_finish_test_keyboard())
+
+@router.callback_query(F.data.startswith("admin_block_sec_"))
+async def admin_choose_block_section(callback: CallbackQuery, state: FSMContext):
+    if not await is_admin(callback.from_user.id):
+        return
+    data = await state.get_data()
+    if not data.get("is_block"):
+        return
+    key=callback.data[len("admin_block_sec_"):]
+    section={"Tarix":"Tarix","Ona_tili":"Ona tili","Matematika":"Matematika",
+             "Main1":"Asosiy fan 1","Main2":"Asosiy fan 2"}.get(key)
+    if not section:
+        await callback.answer("Fan topilmadi.", show_alert=True); return
+    await state.update_data(current_block_section=section)
+    await callback.message.answer(
+        f"📚 <b>{section}</b> tanlandi. {BLOCK_COUNTS[section]} ta savol yuboring.\n"
+        "Rasm + caption, matn yoki Word/PDF yuborishingiz mumkin.",
+        reply_markup=get_block_section_keyboard()
+    )
+    await callback.answer()
+
+@router.callback_query(F.data == "admin_block_finish")
+async def admin_block_finish(callback: CallbackQuery, state: FSMContext):
+    if not await is_admin(callback.from_user.id):
+        return
+    data=await state.get_data()
+    questions=data.get("questions",[])
+    counts={sec:sum(1 for q in questions if q.get("block_section")==sec) for sec in BLOCK_SECTIONS}
+    bad=[f"{sec}: {counts[sec]}/{BLOCK_COUNTS[sec]}" for sec in BLOCK_SECTIONS if counts[sec]!=BLOCK_COUNTS[sec]]
+    if bad:
+        await callback.answer("Savollar soni noto'g'ri.", show_alert=True)
+        await callback.message.answer("❌ Blok test saqlanmaydi:\n"+"\n".join(bad))
+        return
+    # Javoblar hamisha bir xil, aniq tartibda bo'lishi uchun savollarni bo'limlar bo'yicha qayta tartiblaymiz.
+    ordered_questions=[]
+    for sec in BLOCK_SECTIONS:
+        ordered_questions.extend([q for q in questions if q.get("block_section")==sec])
+    await state.update_data(questions=ordered_questions)
+
+    await state.set_state(AdminAddTest.waiting_for_answers)
+    await callback.message.answer(
+        "🔑 90 ta savol uchun to'g'ri javoblarni ketma-ket yuboring (A B C D ...).\n"
+        "Tartib: Tarix 10 → Ona tili 10 → Matematika 10 → Asosiy fan 1 30 → Asosiy fan 2 30.",
+        reply_markup=get_admin_menu()
+    )
+    await callback.answer()
 
 @router.message(AdminAddTest.waiting_for_questions, F.photo)
 async def admin_handle_photo_question(message: Message, state: FSMContext):
@@ -1445,6 +1647,16 @@ async def admin_handle_photo_question(message: Message, state: FSMContext):
     parsed = parse_single_question_text(caption)
     if parsed:
         parsed["photo_file_id"] = photo_id
+        if data.get("is_block"):
+            section=data.get("current_block_section")
+            if not section:
+                await message.answer("❌ Avval fan bo'limini tanlang.")
+                return
+            current=sum(1 for q in q_list if q.get("block_section")==section)
+            if current >= BLOCK_COUNTS[section]:
+                await message.answer(f"⚠️ {section} uchun {BLOCK_COUNTS[section]} ta savol allaqachon yuklangan.")
+                return
+            parsed["block_section"]=section
         q_list.append(parsed)
         await state.update_data(questions=q_list)
         await message.answer(f"📸 Rasmli savol qo'shildi! Jami yuklangan savollar: {len(q_list)}")
@@ -1485,6 +1697,12 @@ async def admin_ask_for_answers(message: Message, state: FSMContext):
     if not data.get("questions"):
         await message.answer("❌ Savollar mavjud emas!")
         return
+    if data.get("is_block"):
+        counts={sec:sum(1 for q in data.get("questions",[]) if q.get("block_section")==sec) for sec in BLOCK_SECTIONS}
+        bad=[f"{sec}: {counts[sec]}/{BLOCK_COUNTS[sec]}" for sec in BLOCK_SECTIONS if counts[sec]!=BLOCK_COUNTS[sec]]
+        if bad:
+            await message.answer("❌ Blok test uchun sonlar noto'g'ri:\n"+"\n".join(bad))
+            return
     await state.set_state(AdminAddTest.waiting_for_answers)
     await message.answer(f"🔑 Jami {len(data.get('questions'))} ta savol uchun to'g'ri javoblarni ketma-ketlikda yuboring (masalan: `A B C D A...`):", reply_markup=get_admin_menu())
 
@@ -1519,36 +1737,42 @@ def parse_single_question_text(text: str) -> dict:
     return None
 
 async def parse_and_add_questions(text: str, state: FSMContext) -> int:
-    data = await state.get_data()
-    questions_list = data.get("questions", [])
-    lines = [line.strip() for line in text.split("\n") if line.strip()]
-    added = 0
-    i = 0
-    while i < len(lines):
-        a_idx, b_idx, c_idx, d_idx = -1, -1, -1, -1
-        for j in range(i + 1, min(i + 6, len(lines))):
-            l = lines[j].lower()
-            if l.startswith("a)") or l.startswith("a."): a_idx = j
-            elif l.startswith("b)") or l.startswith("b."): b_idx = j
-            elif l.startswith("c)") or l.startswith("c."): c_idx = j
-            elif l.startswith("d)") or l.startswith("d."): d_idx = j
-
-        if a_idx != -1 and b_idx != -1:
-            q_text = " ".join(lines[i:a_idx])
+    data=await state.get_data()
+    questions_list=data.get("questions",[])
+    lines=[line.strip() for line in text.split("\n") if line.strip()]
+    section=data.get("current_block_section") if data.get("is_block") else None
+    if data.get("is_block") and not section:
+        return 0
+    existing=sum(1 for q in questions_list if q.get("block_section")==section) if section else 0
+    limit=BLOCK_COUNTS.get(section,10**9)
+    added=0
+    i=0
+    while i<len(lines):
+        a_idx=b_idx=c_idx=d_idx=-1
+        for j in range(i+1,min(i+8,len(lines))):
+            low=lines[j].lower()
+            if low.startswith("a)") or low.startswith("a."): a_idx=j
+            elif low.startswith("b)") or low.startswith("b."): b_idx=j
+            elif low.startswith("c)") or low.startswith("c."): c_idx=j
+            elif low.startswith("d)") or low.startswith("d."): d_idx=j
+        if a_idx!=-1 and b_idx!=-1:
+            if existing+added>=limit: break
             questions_list.append({
-                "text": q_text, 
-                "a": re.sub(r'^[aA][\.\)]\s*', '', lines[a_idx]), 
-                "b": re.sub(r'^[bB][\.\)]\s*', '', lines[b_idx]),
-                "c": re.sub(r'^[cC][\.\)]\s*', '', lines[c_idx]) if c_idx != -1 else "C",
-                "d": re.sub(r'^[dD][\.\)]\s*', '', lines[d_idx]) if d_idx != -1 else "D",
-                "correct": "A",
-                "photo_file_id": None
+                "text":" ".join(lines[i:a_idx]),
+                "a":re.sub(r'^[aA][\.\)]\s*','',lines[a_idx]),
+                "b":re.sub(r'^[bB][\.\)]\s*','',lines[b_idx]),
+                "c":re.sub(r'^[cC][\.\)]\s*','',lines[c_idx]) if c_idx!=-1 else "C",
+                "d":re.sub(r'^[dD][\.\)]\s*','',lines[d_idx]) if d_idx!=-1 else "D",
+                "correct":"A","photo_file_id":None,
+                "block_section":section
             })
-            added += 1
-            i = max(a_idx, b_idx, c_idx, d_idx) + 1
-        else: i += 1
+            added+=1
+            i=max(a_idx,b_idx,c_idx,d_idx)+1
+        else:
+            i+=1
     await state.update_data(questions=questions_list)
     return added
+
 
 @router.message(AdminAddTest.waiting_for_answers)
 async def admin_save_answers_and_test(message: Message, state: FSMContext):
@@ -1571,7 +1795,7 @@ async def admin_save_answers_and_test(message: Message, state: FSMContext):
             mode="global_timer",
             duration_minutes=180 if is_block else data.get("duration_minutes", 60),
             question_time_seconds=data.get("question_time_seconds", 60),
-            questions_count_to_show=data.get("questions_count_to_show", 30),
+            questions_count_to_show=90 if is_block else data.get("questions_count_to_show", 30),
             is_block_test=is_block,
             block_subjects=json.dumps({"sub1": data.get("block_sub1"), "sub2": data.get("block_sub2")}) if is_block else None,
             start_time=data.get("start_time"),
@@ -1586,21 +1810,17 @@ async def admin_save_answers_and_test(message: Message, state: FSMContext):
             sec_name = None
             points = 1.0
             if is_block:
-                if idx < 10:
-                    sec_name = "Tarix"
-                    points = 1.1
-                elif idx < 20:
-                    sec_name = "Ona tili"
-                    points = 1.1
-                elif idx < 30:
-                    sec_name = "Matematika"
-                    points = 1.1
-                elif idx < 60:
-                    sec_name = data.get("block_sub1")
-                    points = 3.1
+                sec_name=q.get("block_section")
+                if sec_name=="Asosiy fan 1":
+                    sec_name=data.get("block_sub1") or "Asosiy fan 1"
+                    points=3.1
+                elif sec_name=="Asosiy fan 2":
+                    sec_name=data.get("block_sub2") or "Asosiy fan 2"
+                    points=2.1
+                elif sec_name in ("Tarix","Ona tili","Matematika"):
+                    points=1.1
                 else:
-                    sec_name = data.get("block_sub2")
-                    points = 2.1
+                    raise ValueError("Blok savolida fan bo'limi belgilanmagan.")
             
             session.add(Question(
                 test_id=new_test.id, 
