@@ -820,19 +820,12 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
 
         if test.is_block_test:
             # Blok testda aynan 10/10/10/30/30 tarkib olinadi.
-            names = json.loads(test.block_subjects or "{}")
-            sub1 = names.get("sub1") or "Asosiy fan 1"
-            sub2 = names.get("sub2") or "Asosiy fan 2"
             grouped_questions = {
                 "Tarix": [], "Ona tili": [], "Matematika": [],
                 "Asosiy fan 1": [], "Asosiy fan 2": []
             }
             for q in all_questions:
-                if q.section_name == sub1:
-                    grouped_questions["Asosiy fan 1"].append(q)
-                elif q.section_name == sub2:
-                    grouped_questions["Asosiy fan 2"].append(q)
-                elif q.section_name in grouped_questions:
+                if q.section_name in grouped_questions:
                     grouped_questions[q.section_name].append(q)
 
             if any(len(grouped_questions[k]) != BLOCK_COUNTS[k] for k in BLOCK_SECTIONS):
@@ -870,17 +863,10 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
 
         if test.is_block_test:
             # Savollarni 10/10/10/30/30 bo'yicha guruhlaymiz.
-            names=json.loads(test.block_subjects or "{}")
-            sub1=names.get("sub1") or "Asosiy fan 1"
-            sub2=names.get("sub2") or "Asosiy fan 2"
             grouped={"Tarix":[],"Ona tili":[],"Matematika":[],"Asosiy fan 1":[],"Asosiy fan 2":[]}
             for q in all_questions:
-                sec=q.section_name
-                if sec==sub1: key="Asosiy fan 1"
-                elif sec==sub2: key="Asosiy fan 2"
-                else: key=sec
-                if key in grouped:
-                    grouped[key].append(q.id)
+                if q.section_name in grouped:
+                    grouped[q.section_name].append(q.id)
             # Savollar oldindan 10/10/10/30/30 tartibida tanlangan.
             block_question_order[test_session.id] = grouped
             block_current_section[test_session.id]=None
@@ -1974,6 +1960,13 @@ async def admin_save_answers_and_test(message: Message, state: FSMContext):
     for idx, q in enumerate(questions_list):
         q["correct"] = tokens[idx]
     
+    if is_block:
+        counts = {sec: sum(1 for q in questions_list if q.get("block_section") == sec) for sec in BLOCK_SECTIONS}
+        bad = [f"{sec}: {counts[sec]}/{BLOCK_COUNTS[sec]}" for sec in BLOCK_SECTIONS if counts[sec] != BLOCK_COUNTS[sec]]
+        if bad:
+            await message.answer("❌ Blok test saqlanmadi. Tarkib noto'g'ri:\n" + "\n".join(bad))
+            return
+
     async with async_session() as session:
         new_test = Test(
             title=data["title"], 
@@ -2000,10 +1993,10 @@ async def admin_save_answers_and_test(message: Message, state: FSMContext):
             if is_block:
                 sec_name=q.get("block_section")
                 if sec_name=="Asosiy fan 1":
-                    sec_name=data.get("block_sub1") or "Asosiy fan 1"
+                    sec_name="Asosiy fan 1"
                     points=3.1
                 elif sec_name=="Asosiy fan 2":
-                    sec_name=data.get("block_sub2") or "Asosiy fan 2"
+                    sec_name="Asosiy fan 2"
                     points=2.1
                 elif sec_name in ("Tarix","Ona tili","Matematika"):
                     points=1.1
