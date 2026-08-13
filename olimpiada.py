@@ -73,6 +73,7 @@ class Payment(Base):
     __tablename__ = "payments"
     id = Column(Integer, primary_key=True, autoincrement=True)
     student_id = Column(Integer, ForeignKey("students.id", ondelete="CASCADE"), nullable=False)
+    test_id = Column(Integer, ForeignKey("tests.id", ondelete="CASCADE"), nullable=True)  # har bir blok test uchun alohida
     receipt_file_id = Column(String(300), nullable=True)
     receipt_type = Column(String(20), nullable=True)  # photo | document
     status = Column(String(20), default="PENDING")  # PENDING | APPROVED | REJECTED
@@ -201,6 +202,13 @@ async def init_db():
             ))
         except Exception:
             pass
+        # Migrate: add test_id to payments (har bir blok test uchun alohida to'lov)
+        try:
+            await conn.execute(sa_text(
+                "ALTER TABLE payments ADD COLUMN test_id INTEGER REFERENCES tests(id) ON DELETE CASCADE"
+            ))
+        except Exception:
+            pass
 
     async with async_session() as session:
         defaults = {
@@ -246,11 +254,35 @@ async def is_paid_mode() -> bool:
     return (await get_setting("paid_mode", "0")) == "1"
 
 
-async def student_has_payment_access(student: Student) -> bool:
-    """Paid mode o'chirilgan bo'lsa hamma ochiq; yoqilgan bo'lsa faqat approved."""
+async def student_has_paid_for_test(student_id: int, test_id: int) -> bool:
+    """Pullik rejim o'chirilgan bo'lsa True. Yoqilgan bo'lsa — shu test uchun APPROVED to'lov bor-yo'qligi."""
     if not await is_paid_mode():
         return True
-    return (student.payment_status or "none") == "approved"
+    async with async_session() as session:
+        payment = (await session.execute(
+            select(Payment).where(
+                Payment.student_id == student_id,
+                Payment.test_id == test_id,
+                Payment.status == "APPROVED"
+            )
+        )).scalar_one_or_none()
+        return payment is not None
+
+
+async def student_payment_status_for_test(student_id: int, test_id: int) -> str:
+    """none | pending | approved | rejected — shu test uchun oxirgi to'lov holati."""
+    if not await is_paid_mode():
+        return "approved"
+    async with async_session() as session:
+        payment = (await session.execute(
+            select(Payment).where(
+                Payment.student_id == student_id,
+                Payment.test_id == test_id
+            ).order_by(Payment.created_at.desc())
+        )).scalars().first()
+        if not payment:
+            return "none"
+        return (payment.status or "PENDING").lower()
 
 async def check_subscription(user_id: int, bot: Bot) -> bool:
     try:
@@ -378,6 +410,7 @@ class TestProcessState(StatesGroup):
     in_test = State()
 
 class PaymentState(StatesGroup):
+    waiting_for_test = State()
     waiting_for_receipt = State()
 
 class AdminPaymentSettings(StatesGroup):
@@ -403,7 +436,7 @@ async def get_main_menu_keyboard():
         [KeyboardButton(text="👤 Profilim"), KeyboardButton(text="📊 Mening urinishlarim")],
         [KeyboardButton(text="⚖️ Apellyatsiya"), KeyboardButton(text="🏆 Reyting")],
         [KeyboardButton(text="ℹ️ Olimpiada haqida")],
-        [KeyboardButton(text="🏠 Asosiy menyu")]
+        [KeyboardButton(text="🚀 Start")]
     ])
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
@@ -419,14 +452,14 @@ def get_admin_menu():
             [KeyboardButton(text="📊 Jonli statistika"), KeyboardButton(text="📥 Excel natijalar")],
             [KeyboardButton(text="⚖️ Apellyatsiyalar"), KeyboardButton(text="👥 Adminlar")],
             [KeyboardButton(text="📢 Xabar yuborish"), KeyboardButton(text="🧹 Bazani tozalash")],
-            [KeyboardButton(text="🏠 Asosiy menyu")]
+            [KeyboardButton(text="🚀 Start")]
         ],
         resize_keyboard=True
     )
 
 def get_cancel_to_menu_keyboard():
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="🏠 Asosiy menyu")]],
+        keyboard=[[KeyboardButton(text="🚀 Start")]],
         resize_keyboard=True
     )
 
@@ -434,7 +467,7 @@ def get_finish_test_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="✅ Testni yakunlash va saqlash")],
-            [KeyboardButton(text="🏠 Asosiy menyu")]
+            [KeyboardButton(text="🚀 Start")]
         ],
         resize_keyboard=True
     )
@@ -545,13 +578,30 @@ async def profile_handler(message: Message, state: FSMContext):
             return
         pay_info = ""
         if await is_paid_mode():
-            status_map = {
-                "none": "❌ To'lov qilinmagan",
-                "pending": "⏳ Tekshiruvda",
-                "approved": "✅ To'lov tasdiqlangan",
-                "rejected": "❌ To'lov rad etilgan",
-            }
-            pay_info = f"\n💳 To'lov: {status_map.get(student.payment_status or 'none', student.payment_status)}"
+            payments = (await session.execute(
+                select(Payment, Test)
+                .outerjoin(Test, Payment.test_id == Test.id)
+                .where(Payment.student_id == student.id)
+                .order_by(Payment.created_at.desc())
+            )).all()
+            if payments:
+                status_map = {
+                    "PENDING": "⏳",
+                    "APPROVED": "✅",
+                    "REJECTED": "❌",
+                }
+                lines = []
+                seen_tests = set()
+                for p, t in payments:
+                    key = p.test_id or 0
+                    if key in seen_tests:
+                        continue
+                    seen_tests.add(key)
+                    tname = t.title if t else "Noma'lum test"
+                    lines.append(f"  {status_map.get(p.status, '?')} {tname}")
+                pay_info = "\n💳 To'lovlar (blok testlar):\n" + "\n".join(lines[:8])
+            else:
+                pay_info = "\n💳 To'lov: hali hech qaysi blok test uchun yo'q"
         markup = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✏️ Profilni tahrirlash", callback_data="edit_profile")]
         ])
@@ -571,7 +621,7 @@ async def start_profile_edit(callback: CallbackQuery, state: FSMContext):
     await state.set_state(ProfileEditState.waiting_for_fullname)
     await callback.message.answer(
         "✏️ <b>Profilni tahrirlash</b>\n\nYangi <b>Ism va Familiyangizni</b> kiriting:\n\n"
-        "(Bekor qilish: 🏠 Asosiy menyu)",
+        "(Bekor qilish: 🚀 Start)",
         reply_markup=get_cancel_to_menu_keyboard()
     )
     await callback.answer()
@@ -579,7 +629,7 @@ async def start_profile_edit(callback: CallbackQuery, state: FSMContext):
 
 @router.message(ProfileEditState.waiting_for_fullname)
 async def profile_edit_fullname(message: Message, state: FSMContext):
-    if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu"):
+    if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
         await back_to_menu(message, state)
         return
     await state.update_data(fullname=message.text.strip())
@@ -589,7 +639,7 @@ async def profile_edit_fullname(message: Message, state: FSMContext):
 
 @router.message(ProfileEditState.waiting_for_age)
 async def profile_edit_age(message: Message, state: FSMContext):
-    if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu"):
+    if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
         await back_to_menu(message, state)
         return
     await state.update_data(age=message.text.strip())
@@ -599,7 +649,7 @@ async def profile_edit_age(message: Message, state: FSMContext):
 
 @router.message(ProfileEditState.waiting_for_grade)
 async def profile_edit_grade(message: Message, state: FSMContext):
-    if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu"):
+    if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
         await back_to_menu(message, state)
         return
     await state.update_data(grade=message.text.strip())
@@ -609,7 +659,7 @@ async def profile_edit_grade(message: Message, state: FSMContext):
 
 @router.message(ProfileEditState.waiting_for_school)
 async def profile_edit_school(message: Message, state: FSMContext):
-    if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu"):
+    if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
         await back_to_menu(message, state)
         return
     data = await state.get_data()
@@ -834,14 +884,7 @@ async def start_test_prompt(message: Message, state: FSMContext):
             await message.answer("❌ Profilingizda sinf ko'rsatilmagan yoki ro'yxatdan o'tmagansiz.")
             return
 
-        if not await student_has_payment_access(student):
-            await message.answer(
-                "🔒 <b>Pullik rejim yoqilgan!</b>\n\n"
-                "Testlarni ishlash uchun avval to'lov qiling.\n"
-                "Asosiy menyudan <b>💳 To'lov qilish</b> tugmasini bosing."
-            )
-            return
-
+        # Oddiy testlar bepul (to'lov faqat blok testlar uchun)
         tests = (await session.execute(
             select(Test).where(
                 Test.is_active == True,
@@ -873,14 +916,6 @@ async def start_block_test_prompt(message: Message, state: FSMContext):
             await message.answer("❌ Ro'yxatdan o'tmagansiz. /start ni bosing.")
             return
 
-        if not await student_has_payment_access(student):
-            await message.answer(
-                "🔒 <b>Pullik rejim yoqilgan!</b>\n\n"
-                "Blok testlarni ishlash uchun avval to'lov qiling.\n"
-                "Asosiy menyudan <b>💳 To'lov qilish</b> tugmasini bosing."
-            )
-            return
-
         tests = (await session.execute(
             select(Test).where(
                 Test.is_active == True,
@@ -893,8 +928,29 @@ async def start_block_test_prompt(message: Message, state: FSMContext):
             await message.answer("⚠️ Hozirda faol blok testlar mavjud emas.")
             return
 
-        keyboard_buttons = [[InlineKeyboardButton(text=f"🧩 {t.subject} — {t.title}", callback_data=f"start_block_{t.id}")] for t in tests]
-        await message.answer("🗂 <b>Mavjud blok testlar:</b>\n\nTestni tanlang:", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_buttons))
+        paid_mode = await is_paid_mode()
+        keyboard_buttons = []
+        for t in tests:
+            mark = ""
+            if paid_mode:
+                st = await student_payment_status_for_test(student.id, t.id)
+                if st == "approved":
+                    mark = " ✅"
+                elif st == "pending":
+                    mark = " ⏳"
+                else:
+                    mark = " 🔒"
+            keyboard_buttons.append([InlineKeyboardButton(
+                text=f"🧩 {t.subject} — {t.title}{mark}",
+                callback_data=f"start_block_{t.id}"
+            )])
+        note = ""
+        if paid_mode:
+            note = "\n\n🔒 — to'lov kerak | ⏳ — tekshiruvda | ✅ — to'langan\nHar bir blok test uchun alohida to'lov qilinadi."
+        await message.answer(
+            f"🗂 <b>Mavjud blok testlar:</b>\n\nTestni tanlang:{note}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+        )
 
 # Fan kalitlari va ko'rinadigan nomlar
 BLOCK_SECTION_KEYS = ["Tarix", "Ona_tili", "Matematika", "sub1", "sub2"]
@@ -1064,6 +1120,29 @@ async def choose_block_subject_menu(callback: CallbackQuery, state: FSMContext):
         test = await session.get(Test, test_id)
         if not test or not test.is_active or test.is_finished:
             await callback.answer("Bu test topilmadi yoki yopilgan!", show_alert=True)
+            return
+
+        # Har bir blok test uchun alohida to'lov (pullik rejim yoqilgan bo'lsa)
+        if student and not await student_has_paid_for_test(student.id, test_id):
+            st = await student_payment_status_for_test(student.id, test_id)
+            if st == "pending":
+                await callback.answer("⏳ Bu test uchun to'lovingiz hali tekshiruvda. Admin javobini kuting.", show_alert=True)
+                return
+            await callback.answer("🔒 Bu blok test uchun to'lov qilinmagan!", show_alert=True)
+            card = await get_setting("payment_card", "8600 XXXX XXXX XXXX")
+            price = await get_setting("payment_price", "50000")
+            markup = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Shu test uchun to'lov qildim", callback_data=f"pay_for_test_{test_id}")]
+            ])
+            await callback.message.answer(
+                f"🔒 <b>Pullik rejim yoqilgan</b>\n\n"
+                f"🧩 Test: <b>{test.title}</b>\n"
+                f"Karta: <code>{card}</code>\n"
+                f"Narx: <b>{price}</b> so'm\n\n"
+                f"Har bir blok test uchun alohida to'lov qilinadi.\n"
+                f"To'lovni amalga oshirgach, pastdagi tugmani bosing va chek yuboring.",
+                reply_markup=markup
+            )
             return
 
         ts = (await session.execute(select(TestSession).where(
@@ -1786,6 +1865,7 @@ async def about_handler(message: Message, state: FSMContext):
 
 
 # ==================== TO'LOV (STUDENT) ====================
+# Har bir blok test uchun alohida to'lov. Admin yangi blok test yuklasa — yana to'lov kerak.
 
 @router.message(F.text == "💳 To'lov qilish")
 async def student_payment_menu(message: Message, state: FSMContext):
@@ -1803,36 +1883,74 @@ async def student_payment_menu(message: Message, state: FSMContext):
             await message.answer("Ro'yxatdan o'tmagansiz. /start ni bosing.")
             return
 
-        if student.payment_status == "approved":
-            await message.answer("✅ To'lovingiz allaqachon tasdiqlangan! Barcha testlardan foydalanishingiz mumkin.")
+        tests = (await session.execute(
+            select(Test).where(
+                Test.is_active == True,
+                Test.is_finished == False,
+                Test.is_block_test == True
+            )
+        )).scalars().all()
+
+        if not tests:
+            await message.answer("⚠️ Hozirda faol blok testlar yo'q. To'lov qilish uchun test bo'lishi kerak.")
             return
-        if student.payment_status == "pending":
-            await message.answer("⏳ To'lovingiz tekshiruvda. Admin javobini kuting.")
-            return
+
+        keyboard = []
+        for t in tests:
+            st = await student_payment_status_for_test(student.id, t.id)
+            if st == "approved":
+                mark = " ✅ to'langan"
+            elif st == "pending":
+                mark = " ⏳ tekshiruvda"
+            else:
+                mark = " 🔒 to'lov kerak"
+            keyboard.append([InlineKeyboardButton(
+                text=f"🧩 {t.title}{mark}",
+                callback_data=f"pay_for_test_{t.id}"
+            )])
 
     card = await get_setting("payment_card", "8600 XXXX XXXX XXXX")
     price = await get_setting("payment_price", "50000")
-    markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ To'lov qildim", callback_data="payment_done")]
-    ])
     await message.answer(
-        f"💳 <b>To'lov ma'lumotlari</b>\n\n"
-        f"Karta raqami: <code>{card}</code>\n"
-        f"Narx: <b>{price}</b> so'm\n\n"
-        f"To'lovni amalga oshirgach, pastdagi tugmani bosing va chek (rasm yoki PDF) yuboring.",
-        reply_markup=markup
+        f"💳 <b>To'lov — har bir blok test alohida</b>\n\n"
+        f"Karta: <code>{card}</code>\n"
+        f"Narx (har bir test): <b>{price}</b> so'm\n\n"
+        f"Qaysi blok test uchun to'lov qilmoqchisiz?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
     )
 
 
-@router.callback_query(F.data == "payment_done")
-async def payment_done_callback(callback: CallbackQuery, state: FSMContext):
+@router.callback_query(F.data.startswith("pay_for_test_"))
+async def pay_for_specific_test(callback: CallbackQuery, state: FSMContext):
     if not await is_paid_mode():
         await callback.answer("Pullik rejim o'chirilgan!", show_alert=True)
         return
+    test_id = int(callback.data.split("_")[3])
+    async with async_session() as session:
+        student = (await session.execute(
+            select(Student).where(Student.telegram_id == callback.from_user.id)
+        )).scalar_one_or_none()
+        test = await session.get(Test, test_id)
+        if not student or not test:
+            await callback.answer("Xato!", show_alert=True)
+            return
+        st = await student_payment_status_for_test(student.id, test_id)
+        if st == "approved":
+            await callback.answer("✅ Bu test uchun to'lov allaqachon tasdiqlangan!", show_alert=True)
+            return
+        if st == "pending":
+            await callback.answer("⏳ Bu test uchun to'lov tekshiruvda. Admin javobini kuting.", show_alert=True)
+            return
+
+    await state.update_data(pay_test_id=test_id)
     await state.set_state(PaymentState.waiting_for_receipt)
+    card = await get_setting("payment_card", "8600 XXXX XXXX XXXX")
+    price = await get_setting("payment_price", "50000")
     await callback.message.answer(
-        "📎 Iltimos, to'lov chekini (rasm yoki PDF/hujjat) yuboring:\n\n"
-        "(Bekor qilish: 🏠 Asosiy menyu)",
+        f"📎 <b>{test.title}</b> uchun to'lov chekini yuboring (rasm yoki PDF).\n\n"
+        f"Karta: <code>{card}</code>\n"
+        f"Narx: <b>{price}</b> so'm\n\n"
+        f"(Bekor qilish: 🚀 Start)",
         reply_markup=get_cancel_to_menu_keyboard()
     )
     await callback.answer()
@@ -1840,8 +1958,15 @@ async def payment_done_callback(callback: CallbackQuery, state: FSMContext):
 
 @router.message(PaymentState.waiting_for_receipt, F.photo | F.document)
 async def receive_payment_receipt(message: Message, state: FSMContext, bot: Bot):
-    if message.text and message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu"):
+    if message.text and message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
         await back_to_menu(message, state)
+        return
+
+    data = await state.get_data()
+    test_id = data.get("pay_test_id")
+    if not test_id:
+        await message.answer("❌ Avval qaysi test uchun to'lov qilishni tanlang (💳 To'lov qilish).")
+        await state.clear()
         return
 
     file_id = None
@@ -1865,23 +1990,25 @@ async def receive_payment_receipt(message: Message, state: FSMContext, bot: Bot)
             await state.clear()
             return
 
+        test = await session.get(Test, test_id)
         payment = Payment(
             student_id=student.id,
+            test_id=test_id,
             receipt_file_id=file_id,
             receipt_type=receipt_type,
             status="PENDING"
         )
         session.add(payment)
-        student.payment_status = "pending"
         await session.commit()
         await session.refresh(payment)
 
-        # Adminlarga xabar
         admins = (await session.execute(select(Admin))).scalars().all()
         admin_ids = set(SUPER_ADMIN_IDS) | {a.telegram_id for a in admins}
 
+        test_title = test.title if test else f"Test #{test_id}"
         caption = (
             f"💳 <b>Yangi to'lov so'rovi #{payment.id}</b>\n\n"
+            f"🧩 Test: <b>{test_title}</b>\n"
             f"👤 {student.first_name} {student.last_name}\n"
             f"ID: <code>{student.student_id}</code>\n"
             f"Sinf: {student.grade or '-'}\n"
@@ -1907,14 +2034,14 @@ async def receive_payment_receipt(message: Message, state: FSMContext, bot: Bot)
     await state.clear()
     main_menu = await get_main_menu_keyboard()
     await message.answer(
-        "✅ Chekingiz adminga yuborildi. Tasdiqlanishini kuting.",
+        f"✅ <b>{test_title}</b> uchun chekingiz adminga yuborildi. Tasdiqlanishini kuting.",
         reply_markup=main_menu
     )
 
 
 @router.message(PaymentState.waiting_for_receipt)
 async def payment_receipt_invalid(message: Message, state: FSMContext):
-    if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu"):
+    if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
         await back_to_menu(message, state)
         return
     await message.answer("❌ Iltimos, chekni rasm yoki PDF/hujjat sifatida yuboring.")
@@ -1934,8 +2061,9 @@ async def admin_paid_mode_menu(message: Message):
     ]])
     await message.answer(
         f"💰 <b>Pullik rejim</b>\n\nHozirgi holat: <b>{status_text}</b>\n\n"
-        f"Yoqilganda o'quvchilar to'lov qilmasdan test ishlay olmaydi.\n"
-        f"O'chirilganda barcha testlar bepul.",
+        f"🟢 Yoqilganda: har bir <b>blok test</b> uchun alohida to'lov kerak.\n"
+        f"   (Masalan: Matematika+Fizika va Matematika+Ingliz — ikki xil to'lov)\n"
+        f"🔴 O'chirilganda: barcha testlar bepul, to'lov so'ralmaydi.",
         reply_markup=markup
     )
 
@@ -1968,7 +2096,7 @@ async def admin_payment_settings_prompt(message: Message, state: FSMContext):
 
 @router.message(AdminPaymentSettings.waiting_for_card)
 async def admin_set_card(message: Message, state: FSMContext):
-    if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu"):
+    if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
         await back_to_menu(message, state)
         return
     txt = message.text.strip()
@@ -1980,7 +2108,7 @@ async def admin_set_card(message: Message, state: FSMContext):
 
 @router.message(AdminPaymentSettings.waiting_for_price)
 async def admin_set_price(message: Message, state: FSMContext):
-    if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu"):
+    if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
         await back_to_menu(message, state)
         return
     txt = message.text.strip()
@@ -2008,8 +2136,11 @@ async def admin_payment_requests(message: Message):
             return
         for p in payments:
             student = await session.get(Student, p.student_id)
+            test = await session.get(Test, p.test_id) if p.test_id else None
+            test_line = f"🧩 Test: <b>{test.title}</b>\n" if test else ""
             caption = (
                 f"💳 <b>To'lov #{p.id}</b>\n"
+                f"{test_line}"
                 f"👤 {student.first_name} {student.last_name} ({student.student_id})\n"
                 f"Sinf: {student.grade or '-'}"
             )
@@ -2041,16 +2172,18 @@ async def approve_payment(callback: CallbackQuery, bot: Bot):
         payment.status = "APPROVED"
         payment.reviewed_at = datetime.now(timezone.utc)
         student = await session.get(Student, payment.student_id)
-        if student:
-            student.payment_status = "approved"
+        test = await session.get(Test, payment.test_id) if payment.test_id else None
         await session.commit()
 
+        test_title = test.title if test else "blok test"
         if student and student.telegram_id:
             try:
                 main_menu = await get_main_menu_keyboard()
                 await bot.send_message(
                     chat_id=student.telegram_id,
-                    text="✅ <b>To'lovingiz tasdiqlandi!</b>\n\nEndi barcha testlardan foydalanishingiz mumkin.",
+                    text=f"✅ <b>To'lovingiz tasdiqlandi!</b>\n\n"
+                         f"🧩 Test: <b>{test_title}</b>\n"
+                         f"Endi shu blok testdan foydalanishingiz mumkin.",
                     reply_markup=main_menu
                 )
             except Exception:
@@ -2083,16 +2216,17 @@ async def reject_payment(callback: CallbackQuery, bot: Bot):
         payment.status = "REJECTED"
         payment.reviewed_at = datetime.now(timezone.utc)
         student = await session.get(Student, payment.student_id)
-        if student:
-            student.payment_status = "rejected"
+        test = await session.get(Test, payment.test_id) if payment.test_id else None
         await session.commit()
 
+        test_title = test.title if test else "blok test"
         if student and student.telegram_id:
             try:
                 await bot.send_message(
                     chat_id=student.telegram_id,
-                    text="❌ <b>To'lov qilinmadi</b> deb belgiladi admin.\n\n"
-                         "Agar xato deb hisoblasangiz, qayta to'lov qilib chek yuboring."
+                    text=f"❌ <b>To'lov qilinmadi</b> deb belgiladi admin.\n\n"
+                         f"🧩 Test: <b>{test_title}</b>\n"
+                         f"Agar xato deb hisoblasangiz, qayta to'lov qilib chek yuboring."
                 )
             except Exception:
                 pass
@@ -2355,7 +2489,7 @@ async def admin_ask_for_answers(message: Message, state: FSMContext):
 async def admin_add_bulk_questions_text(message: Message, state: FSMContext):
     if not await is_admin(message.from_user.id):
         return
-    if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu"):
+    if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
         await back_to_menu(message, state)
         return
     if message.text == "✅ Testni yakunlash va saqlash":
@@ -2445,7 +2579,7 @@ async def parse_and_add_questions(text: str, state: FSMContext) -> int:
 async def admin_save_answers_and_test(message: Message, state: FSMContext):
     if not await is_admin(message.from_user.id):
         return
-    if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu"):
+    if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
         await back_to_menu(message, state)
         return
     tokens = re.findall(r'[A-D]', message.text.upper())
@@ -2865,9 +2999,9 @@ async def send_broadcast(message: Message, state: FSMContext, bot: Bot):
     await state.clear()
     await message.answer(f"✅ Xabar {success} ta o'quvchiga yuborildi!", reply_markup=get_admin_menu())
 
-@router.message(F.text.in_(["🏠 Asosiy menyu", "⬅️ Bosh menyu"]))
-async def back_to_menu(message: Message, state: FSMContext):
-    """Har qanday holatda (test, yuklash, FSM) asosiy menyuga qaytish."""
+@router.message(F.text.in_(["🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"]))
+async def back_to_menu(message: Message, state: FSMContext, bot: Bot = None):
+    """🚀 Start yoki Asosiy menyu — /start kabi qayta ishga tushirish."""
     was_in_test = await state.get_state() == TestProcessState.in_test.state
     await state.clear()
     user_next_question_flags.pop(message.from_user.id, None)
@@ -2890,22 +3024,43 @@ async def back_to_menu(message: Message, state: FSMContext):
                     await calculate_and_save_results(session, ts)
                 await session.commit()
 
+    # Admin
     if await is_admin(message.from_user.id):
-        await message.answer("🛠 <b>Admin menyu</b>", reply_markup=get_admin_menu())
-    else:
-        async with async_session() as session:
-            student = (await session.execute(
-                select(Student).where(Student.telegram_id == message.from_user.id)
-            )).scalar_one_or_none()
-        if student:
-            main_menu = await get_main_menu_keyboard()
-            note = "\n\n⚠️ Test jarayoni to'xtatildi va natija saqlandi." if was_in_test else ""
+        await message.answer("🛠 <b>Xush kelibsiz, Admin!</b>", reply_markup=get_admin_menu())
+        return
+
+    # Obuna tekshiruvi (bot bo'lsa)
+    if bot is not None:
+        is_subscribed = await check_subscription(message.from_user.id, bot)
+        if not is_subscribed:
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📢 Kanalga obuna bo'lish", url=f"https://t.me/{REQUIRED_CHANNEL.replace('@', '')}")],
+                [InlineKeyboardButton(text="✅ Obunani tekshirish", callback_data="check_sub")]
+            ])
             await message.answer(
-                f"🏠 <b>Asosiy menyu</b>\n\nXush kelibsiz, <b>{student.first_name} {student.last_name}</b>!{note}",
-                reply_markup=main_menu
+                f"⚠️ Botdan foydalanish uchun avval quyidagi kanalga obuna bo'lishingiz kerak:\n\n{REQUIRED_CHANNEL}",
+                reply_markup=keyboard
             )
-        else:
-            await message.answer("Ro'yxatdan o'tmagansiz. /start ni bosing.")
+            return
+
+    async with async_session() as session:
+        student = (await session.execute(
+            select(Student).where(Student.telegram_id == message.from_user.id)
+        )).scalar_one_or_none()
+    if student:
+        if not student.is_active:
+            await message.answer("❌ Sizning profilingiz administrator tomonidan bloklangan.")
+            return
+        main_menu = await get_main_menu_keyboard()
+        note = "\n\n⚠️ Test jarayoni to'xtatildi va natija saqlandi." if was_in_test else ""
+        await message.answer(
+            f"🚀 <b>Start</b>\n\nXush kelibsiz, <b>{student.first_name} {student.last_name}</b>!\n"
+            f"Sinfingiz: <b>{student.grade or 'Nomaʼlum'}</b>{note}",
+            reply_markup=main_menu
+        )
+    else:
+        await state.set_state(SelfRegState.waiting_for_fullname)
+        await message.answer("🎓 <b>Olimpiada tizimiga xush kelibsiz!</b>\n\nIltimos, to'liq <b>Ism va Familiyangizni</b> kiriting:")
 
 async def reminder_scheduler(bot: Bot):
     while True:
