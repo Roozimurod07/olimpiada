@@ -1587,8 +1587,10 @@ async def admin_get_title(message: Message, state: FSMContext):
     await state.update_data(title=message.text.strip())
     data = await state.get_data()
     if data.get("is_block"):
-        await state.set_state(AdminAddTest.waiting_for_grade)
-        await message.answer("Sinfni kiriting (masalan: `11-sinf`):")
+        # Blok test hamma sinflar uchun — sinf so'ralmaydi
+        await state.update_data(grade="Barcha")
+        await state.set_state(AdminAddTest.waiting_for_block_sub1)
+        await message.answer("1-asosiy fanning nomini kiriting (masalan: Fizika yoki Biologiya):")
     else:
         await state.set_state(AdminAddTest.waiting_for_subject)
         await message.answer("Fan nomini kiriting:")
