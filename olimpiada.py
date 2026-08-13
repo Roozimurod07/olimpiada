@@ -33,7 +33,7 @@ from google.oauth2.service_account import Credentials
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON")
 SHEET_NAME = "Olimpiada"
-REQUIRED_CHANNEL = "@olimpiada01111"
+REQUIRED_CHANNEL = "@diamir_edu"
 
 SUPER_ADMIN_IDS = [8317043750]
 
