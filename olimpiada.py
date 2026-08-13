@@ -150,13 +150,22 @@ class Appeal(Base):
 
 DB_DIR = os.getenv("DB_DIR", ".")
 DB_PATH = os.path.join(DB_DIR, "professional_olimpiada.db")
-engine = create_async_engine(f"sqlite+aiosqlite:///{DB_PATH}", echo=False, pool_size=20, max_overflow=40)
+engine = create_async_engine(
+    f"sqlite+aiosqlite:///{DB_PATH}",
+    echo=False,
+    pool_size=50,
+    max_overflow=100,
+    pool_timeout=60,
+)
 
 @event.listens_for(engine.sync_engine, "connect")
 def set_sqlite_pragma(dbapi_connection, connection_record):
     cursor = dbapi_connection.cursor()
     cursor.execute("PRAGMA foreign_keys=ON")
     cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA synchronous=NORMAL")
+    # 1000+ o'quvchi bir vaqtda yozganda "database is locked" xatosini oldini olish uchun
+    cursor.execute("PRAGMA busy_timeout=30000")
     cursor.close()
 
 async_session = async_sessionmaker(engine, expire_on_commit=False)
@@ -614,6 +623,60 @@ async def start_test_prompt(message: Message, state: FSMContext):
         keyboard_buttons = [[InlineKeyboardButton(text=f"📚 {t.subject} — {t.title}", callback_data=f"start_test_{t.id}")] for t in tests]
         await message.answer("📝 <b>Mavjud testlar:</b>\n\nTestni tanlang:", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_buttons))
 
+async def get_block_time_left(test: Test, ts: TestSession) -> int:
+    """Blok test uchun umumiy 180 daqiqadan necha soniya qolganini hisoblaydi."""
+    started = ts.started_at.replace(tzinfo=timezone.utc) if ts.started_at.tzinfo is None else ts.started_at
+    total_duration_sec = test.duration_minutes * 60
+    elapsed = (datetime.now(timezone.utc) - started).total_seconds()
+    return max(0, int(total_duration_sec - elapsed))
+
+async def finish_block_session_auto(session, ts: TestSession, bot: Bot, notify: bool = True):
+    """Blok test sessiyasini (vaqt tugagani sababli) majburiy yakunlaydi va natijani saqlaydi."""
+    ts.status = "COMPLETED"
+    ts.finished_at = datetime.now(timezone.utc)
+    await calculate_and_save_results(session, ts)
+    await session.commit()
+
+    student_obj = await session.get(Student, ts.student_id)
+    test_obj = await session.get(Test, ts.test_id)
+    if student_obj and test_obj:
+        save_result_to_sheet(
+            student_obj.student_id, f"{student_obj.first_name} {student_obj.last_name}",
+            student_obj.age or "-", student_obj.school or "-", student_obj.grade or "Barchaga umumiy",
+            test_obj.title, test_obj.subject, ts.score, ts.score_percentage, ts.correct_answers, ts.wrong_answers
+        )
+        if notify and student_obj.telegram_id:
+            try:
+                main_menu = await get_main_menu_keyboard()
+                await bot.send_message(
+                    chat_id=student_obj.telegram_id,
+                    text=(f"⏰ <b>Blok test uchun ajratilgan 180 daqiqa tugadi!</b>\n\n"
+                          f"Test avtomatik yakunlandi.\nSiz to'plagan ball: <b>{ts.score}</b> ({ts.score_percentage}%)."),
+                    reply_markup=main_menu
+                )
+            except Exception:
+                pass
+
+async def block_test_timeout_scheduler(bot: Bot):
+    """Vaqti (180 daqiqa) tugagan, lekin o'quvchi tomonidan yakunlanmagan blok test
+    sessiyalarini fon rejimida avtomatik yakunlab, natijani saqlaydi."""
+    while True:
+        await asyncio.sleep(20)
+        try:
+            async with async_session() as session:
+                rows = (await session.execute(
+                    select(TestSession, Test)
+                    .join(Test, TestSession.test_id == Test.id)
+                    .where(TestSession.status == "IN_PROGRESS", Test.is_block_test == True)
+                )).all()
+
+                for ts, test in rows:
+                    seconds_left = await get_block_time_left(test, ts)
+                    if seconds_left <= 0:
+                        await finish_block_session_auto(session, ts, bot)
+        except Exception as e:
+            logging.error(f"Blok test taymer nazoratchisi xatosi: {e}")
+
 @router.message(F.text == "🗂 Blok testlar")
 async def start_block_test_prompt(message: Message, state: FSMContext):
     if await state.get_state() == TestProcessState.in_test.state: return
@@ -644,16 +707,50 @@ async def start_block_test_prompt(message: Message, state: FSMContext):
         await message.answer("🗂 <b>Mavjud blok testlar:</b>\n\nTestni tanlang:", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_buttons))
 
 @router.callback_query(F.data.startswith("start_block_"))
-async def choose_block_subject_menu(callback: CallbackQuery, state: FSMContext):
+async def choose_block_subject_menu(callback: CallbackQuery, state: FSMContext, bot: Bot):
     test_id = int(callback.data.split("_")[2])
     async with async_session() as session:
         test = await session.get(Test, test_id)
         if not test or not test.is_active or test.is_finished:
             await callback.answer("Bu test topilmadi yoki yopilgan!", show_alert=True)
             return
-            
+
+        student = (await session.execute(select(Student).where(Student.telegram_id == callback.from_user.id))).scalar_one_or_none()
+        if not student:
+            await callback.answer("❌ Ro'yxatdan o'tmagansiz.", show_alert=True)
+            return
+
+        ts = (await session.execute(select(TestSession).where(
+            TestSession.student_id == student.id,
+            TestSession.test_id == test_id,
+            TestSession.status == "IN_PROGRESS"
+        ))).scalar_one_or_none()
+
+        if not ts:
+            completed = (await session.execute(select(TestSession).where(
+                TestSession.student_id == student.id,
+                TestSession.test_id == test_id,
+                TestSession.status == "COMPLETED"
+            ))).scalar_one_or_none()
+            if completed:
+                await callback.answer("❌ Siz bu blok testni allaqachon topshirgansiz!", show_alert=True)
+                return
+            # Umumiy 180 daqiqalik taymer aynan shu yerda — testga birinchi kirishda boshlanadi
+            ts = TestSession(student_id=student.id, test_id=test_id, status="IN_PROGRESS")
+            session.add(ts)
+            await session.commit()
+            await session.refresh(ts)
+
+        seconds_left = await get_block_time_left(test, ts)
+        if seconds_left <= 0:
+            await finish_block_session_auto(session, ts, bot)
+            await callback.answer("⏰ Test uchun ajratilgan 180 daqiqa allaqachon tugagan!", show_alert=True)
+            return
+
         block_subs = json.loads(test.block_subjects) if test.block_subjects else {"sub1": "1-Asosiy fan", "sub2": "2-Asosiy fan"}
-        
+        title = test.title
+
+    minutes_left = seconds_left // 60
     keyboard = [
         [InlineKeyboardButton(text="🏛 Tarix (10 ta)", callback_data=f"run_block_{test_id}_Tarix")],
         [InlineKeyboardButton(text="🇺🇿 Ona tili (10 ta)", callback_data=f"run_block_{test_id}_Ona_tili")],
@@ -663,8 +760,8 @@ async def choose_block_subject_menu(callback: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="🚀 Testni yakunlash va topshirish", callback_data=f"finish_block_session_{test_id}")]
     ]
     await callback.message.edit_text(
-        f"🧩 <b>{test.title}</b>\n\n"
-        "⏱ Umumiy vaqt: <b>180 daqiqa</b>\n"
+        f"🧩 <b>{title}</b>\n\n"
+        f"⏱ Qolgan umumiy vaqt: <b>{minutes_left} daqiqa</b>\n"
         "Istalgan fandan boshlashingiz mumkin. Har bir fanda savollar random tarzda taqdim etiladi va belgilaganingizdan so'ng ro'yxatdan o'chib boradi.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
     )
@@ -696,6 +793,24 @@ async def run_block_subject_questions(callback: CallbackQuery, state: FSMContext
             session.add(ts)
             await session.commit()
             await session.refresh(ts)
+
+        # Umumiy 180 daqiqalik vaqt tugagan bo'lsa — testni majburiy yakunlaymiz
+        seconds_left = await get_block_time_left(test, ts)
+        if seconds_left <= 0:
+            await finish_block_session_auto(session, ts, bot)
+            try:
+                await callback.message.delete()
+            except Exception:
+                pass
+            main_menu = await get_main_menu_keyboard()
+            await bot.send_message(
+                chat_id=callback.from_user.id,
+                text=f"🏆 <b>BLOK TEST YAKUNLANDI!</b>\n\n⏰ Vaqt tugagani sababli test avtomatik yakunlandi.\nSiz to'plagan ball: <b>{ts.score}</b> ({ts.score_percentage}%).",
+                reply_markup=main_menu
+            )
+            await state.clear()
+            await callback.answer()
+            return
 
         questions = (await session.execute(
             select(Question).where(Question.test_id == test_id, Question.section_name == actual_section)
@@ -742,7 +857,7 @@ async def run_block_subject_questions(callback: CallbackQuery, state: FSMContext
     keyboard_buttons.append([InlineKeyboardButton(text="⬅️ Fanlar menyusiga qaytish", callback_data=f"back_to_block_menu_{test_id}")])
     markup = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
     
-    text_content = f"📚 <b>Fan: {actual_section}</b>\n📊 Bajarildi: {done_count} / {total_q_count}\n\n{q.question_text}"
+    text_content = f"📚 <b>Fan: {actual_section}</b>\n📊 Bajarildi: {done_count} / {total_q_count}\n⏱ Umumiy qolgan vaqt: {seconds_left // 60} daqiqa\n\n{q.question_text}"
     
     await callback.message.delete()
     await state.set_state(TestProcessState.in_test)
@@ -767,6 +882,29 @@ async def save_block_answer_and_next(callback: CallbackQuery, state: FSMContext,
         if existing: existing.selected_option = selected
         else: session.add(Answer(session_id=session_id, question_id=question_id, selected_option=selected))
         await session.commit()
+
+        # Har bir javobdan keyin umumiy 180 daqiqalik vaqtni tekshiramiz
+        ts = await session.get(TestSession, session_id)
+        test = await session.get(Test, test_id)
+        if ts and test and ts.status == "IN_PROGRESS":
+            seconds_left = await get_block_time_left(test, ts)
+            if seconds_left <= 0:
+                await finish_block_session_auto(session, ts, bot)
+                try:
+                    await callback.message.delete()
+                except Exception:
+                    pass
+                main_menu = await get_main_menu_keyboard()
+                await bot.send_message(
+                    chat_id=callback.from_user.id,
+                    text=f"🏆 <b>BLOK TEST YAKUNLANDI!</b>\n\n⏰ Vaqt tugagani sababli test avtomatik yakunlandi.\nSiz to'plagan ball: <b>{ts.score}</b> ({ts.score_percentage}%).",
+                    reply_markup=main_menu
+                )
+                await state.clear()
+                await callback.answer(f"Tanlandi: {selected}")
+                return
+        else:
+            seconds_left = 0
 
         questions = (await session.execute(
             select(Question).where(Question.test_id == test_id, Question.section_name == actual_section)
@@ -808,7 +946,7 @@ async def save_block_answer_and_next(callback: CallbackQuery, state: FSMContext,
     keyboard_buttons.append([InlineKeyboardButton(text="⬅️ Fanlar menyusiga qaytish", callback_data=f"back_to_block_menu_{test_id}")])
     markup = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
     
-    text_content = f"📚 <b>Fan: {actual_section}</b>\n📊 Bajarildi: {done_count} / {total_q_count}\n\n{q.question_text}"
+    text_content = f"📚 <b>Fan: {actual_section}</b>\n📊 Bajarildi: {done_count} / {total_q_count}\n⏱ Umumiy qolgan vaqt: {seconds_left // 60} daqiqa\n\n{q.question_text}"
     
     await callback.message.delete()
     if q.photo_file_id:
@@ -818,12 +956,42 @@ async def save_block_answer_and_next(callback: CallbackQuery, state: FSMContext,
     await callback.answer(f"Tanlandi: {selected}")
 
 @router.callback_query(F.data.startswith("back_to_block_menu_"))
-async def return_to_block_menu(callback: CallbackQuery, state: FSMContext):
+async def return_to_block_menu(callback: CallbackQuery, state: FSMContext, bot: Bot):
     test_id = int(callback.data.split("_")[4])
     async with async_session() as session:
         test = await session.get(Test, test_id)
+        student = (await session.execute(select(Student).where(Student.telegram_id == callback.from_user.id))).scalar_one_or_none()
+        ts = None
+        if student:
+            ts = (await session.execute(select(TestSession).where(
+                TestSession.student_id == student.id,
+                TestSession.test_id == test_id,
+                TestSession.status == "IN_PROGRESS"
+            ))).scalar_one_or_none()
+
+        if ts:
+            seconds_left = await get_block_time_left(test, ts)
+            if seconds_left <= 0:
+                await finish_block_session_auto(session, ts, bot)
+                try:
+                    await callback.message.delete()
+                except Exception:
+                    pass
+                main_menu = await get_main_menu_keyboard()
+                await callback.message.answer(
+                    f"🏆 <b>BLOK TEST YAKUNLANDI!</b>\n\n⏰ Vaqt tugagani sababli test avtomatik yakunlandi.\nSiz to'plagan ball: <b>{ts.score}</b> ({ts.score_percentage}%).",
+                    reply_markup=main_menu
+                )
+                await state.clear()
+                await callback.answer()
+                return
+        else:
+            seconds_left = test.duration_minutes * 60
+
         block_subs = json.loads(test.block_subjects) if test.block_subjects else {"sub1": "1-Asosiy fan", "sub2": "2-Asosiy fan"}
-        
+        title = test.title
+
+    minutes_left = seconds_left // 60
     keyboard = [
         [InlineKeyboardButton(text="🏛 Tarix (10 ta)", callback_data=f"run_block_{test_id}_Tarix")],
         [InlineKeyboardButton(text="🇺🇿 Ona tili (10 ta)", callback_data=f"run_block_{test_id}_Ona_tili")],
@@ -838,7 +1006,7 @@ async def return_to_block_menu(callback: CallbackQuery, state: FSMContext):
     except Exception:
         pass
     await callback.message.answer(
-        f"🧩 <b>{test.title}</b> — Fanlar bo'limi:",
+        f"🧩 <b>{title}</b> — Fanlar bo'limi:\n⏱ Qolgan umumiy vaqt: <b>{minutes_left} daqiqa</b>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
     )
     await callback.answer()
@@ -862,14 +1030,24 @@ async def finish_block_test_by_student(callback: CallbackQuery, state: FSMContex
             
             test_obj = await session.get(Test, test_id)
             save_result_to_sheet(student.student_id, f"{student.first_name} {student.last_name}", student.age or "-", student.school or "-", student.grade or "Barchaga umumiy", test_obj.title, test_obj.subject, ts.score, ts.score_percentage, ts.correct_answers, ts.wrong_answers)
-            
+        elif student:
+            # ts topilmadi — masalan vaqt tugab, fon jarayoni allaqachon avtomatik yakunlagan bo'lishi mumkin
+            ts = (await session.execute(select(TestSession).where(
+                TestSession.student_id == student.id,
+                TestSession.test_id == test_id,
+                TestSession.status == "COMPLETED"
+            ).order_by(TestSession.id.desc()))).scalars().first()
+
     await state.clear()
     main_menu = await get_main_menu_keyboard()
     try:
         await callback.message.delete()
     except Exception:
         pass
-    await callback.message.answer(f"🏆 <b>BLOK TEST YAKUNLANDI!</b>\n\nSiz to'plagan ball: <b>{ts.score}</b> ({ts.score_percentage}%).", reply_markup=main_menu)
+    if ts:
+        await callback.message.answer(f"🏆 <b>BLOK TEST YAKUNLANDI!</b>\n\nSiz to'plagan ball: <b>{ts.score}</b> ({ts.score_percentage}%).", reply_markup=main_menu)
+    else:
+        await callback.message.answer("⚠️ Faol test sessiyasi topilmadi.", reply_markup=main_menu)
     await callback.answer()
 
 @router.callback_query(F.data.startswith("start_test_"))
@@ -921,114 +1099,131 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
         await session.commit()
         await session.refresh(test_session)
 
-        await callback.message.edit_text(f"🚀 <b>{test.subject} ({test.title})</b> testi boshlandi!")
-        user_id = callback.from_user.id
-        await state.set_state(TestProcessState.in_test)
-        
-        total_duration_sec = test.duration_minutes * 60
-        start_timestamp = datetime.now(timezone.utc)
-        
-        for index, q in enumerate(questions):
-            current_test_check = await session.get(Test, test_id)
-            if not current_test_check.is_active or current_test_check.is_finished:
+        # Testni bajarish uzoq davom etadi (180 daqiqagacha), shu sababli kerakli
+        # ma'lumotlarni xotiraga olib, DB sessiyasini DARHOL yopamiz — aks holda
+        # ulanish butun test davomida band bo'lib qoladi va minglab o'quvchi bir
+        # vaqtda test ishlaganda ulanishlar tugab qoladi (pool exhaustion).
+        test_session_id = test_session.id
+        duration_minutes = test.duration_minutes
+        question_time_seconds = test.question_time_seconds
+        subject_title = test.subject
+        test_title = test.title
+        q_data = [{
+            "id": q.id, "section_name": q.section_name, "question_text": q.question_text,
+            "photo_file_id": q.photo_file_id, "option_a": q.option_a, "option_b": q.option_b,
+            "option_c": q.option_c, "option_d": q.option_d, "points": q.points,
+        } for q in questions]
+
+    await callback.message.edit_text(f"🚀 <b>{subject_title} ({test_title})</b> testi boshlandi!")
+    user_id = callback.from_user.id
+    await state.set_state(TestProcessState.in_test)
+
+    total_duration_sec = duration_minutes * 60
+    start_timestamp = datetime.now(timezone.utc)
+
+    for index, qd in enumerate(q_data):
+        elapsed = (datetime.now(timezone.utc) - start_timestamp).total_seconds()
+        if elapsed >= total_duration_sec:
+            await bot.send_message(chat_id=user_id, text="⏰ Test uchun ajratilgan umumiy vaqt tugadi!")
+            break
+
+        # Testning hali ham faolligini qisqa (darhol yopiladigan) sessiya bilan tekshiramiz
+        async with async_session() as check_session:
+            current_test_check = await check_session.get(Test, test_id)
+            if not current_test_check or not current_test_check.is_active or current_test_check.is_finished:
                 break
 
-            elapsed = (datetime.now(timezone.utc) - start_timestamp).total_seconds()
-            if elapsed >= total_duration_sec:
-                await bot.send_message(chat_id=user_id, text="⏰ Test uchun ajratilgan umumiy vaqt tugadi!")
+        options = [("A", qd["option_a"]), ("B", qd["option_b"])]
+        if qd["option_c"]: options.append(("C", qd["option_c"]))
+        if qd["option_d"]: options.append(("D", qd["option_d"]))
+
+        keyboard_buttons = []
+        row = []
+        for opt_key, text_val in options:
+            row.append(InlineKeyboardButton(text=f"{opt_key}) {text_val}", callback_data=f"ans_{test_session_id}_{qd['id']}_{opt_key}"))
+            if len(row) == 2:
+                keyboard_buttons.append(row)
+                row = []
+        if row: keyboard_buttons.append(row)
+
+        markup = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+
+        sec_title = f"<b>Fan / Bo'lim: {qd['section_name']}</b>\n" if qd['section_name'] else ""
+        text_content = f"{sec_title}<b>Savol {index + 1} / {len(q_data)}</b> (Ball: {qd['points']})\n\n{qd['question_text']}"
+
+        if qd["photo_file_id"]:
+            q_msg = await bot.send_photo(chat_id=user_id, photo=qd["photo_file_id"], caption=text_content, reply_markup=markup)
+        else:
+            q_msg = await bot.send_message(chat_id=user_id, text=text_content, reply_markup=markup)
+
+        q_start_time = datetime.now(timezone.utc)
+        question_seconds = max(1, int(question_time_seconds))
+        timer_msg = await bot.send_message(
+            chat_id=user_id,
+            text=f"⏳ <b>Qolgan vaqt: {question_seconds} soniya</b>"
+        )
+        last_second = question_seconds
+
+        user_next_question_flags.pop(user_id, None)
+
+        while True:
+            await asyncio.sleep(0.2)
+            now = datetime.now(timezone.utc)
+            total_elapsed = (now - start_timestamp).total_seconds()
+            q_elapsed = (now - q_start_time).total_seconds()
+
+            if total_elapsed >= total_duration_sec:
                 break
 
-            options = [("A", q.option_a), ("B", q.option_b)]
-            if q.option_c: options.append(("C", q.option_c))
-            if q.option_d: options.append(("D", q.option_d))
-            
-            keyboard_buttons = []
-            row = []
-            for opt_key, text_val in options:
-                row.append(InlineKeyboardButton(text=f"{opt_key}) {text_val}", callback_data=f"ans_{test_session.id}_{q.id}_{opt_key}"))
-                if len(row) == 2:
-                    keyboard_buttons.append(row)
-                    row = []
-            if row: keyboard_buttons.append(row)
-            
-            markup = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
-            
-            sec_title = f"<b>Fan / Bo'lim: {q.section_name}</b>\n" if q.section_name else ""
-            text_content = f"{sec_title}<b>Savol {index + 1} / {len(questions)}</b> (Ball: {q.points})\n\n{q.question_text}"
-            
-            if q.photo_file_id:
-                q_msg = await bot.send_photo(chat_id=user_id, photo=q.photo_file_id, caption=text_content, reply_markup=markup)
-            else:
-                q_msg = await bot.send_message(chat_id=user_id, text=text_content, reply_markup=markup)
-
-            q_start_time = datetime.now(timezone.utc)
-            question_seconds = max(1, int(test.question_time_seconds))
-            timer_msg = await bot.send_message(
-                chat_id=user_id,
-                text=f"⏳ <b>Qolgan vaqt: {question_seconds} soniya</b>"
-            )
-            last_second = question_seconds
-
-            user_next_question_flags.pop(user_id, None)
-
-            while True:
-                await asyncio.sleep(0.2)
-                now = datetime.now(timezone.utc)
-                total_elapsed = (now - start_timestamp).total_seconds()
-                q_elapsed = (now - q_start_time).total_seconds()
-
-                if total_elapsed >= total_duration_sec:
-                    break
-
-                if user_id in user_next_question_flags:
-                    user_next_question_flags.pop(user_id, None)
-                    break
-
-                seconds_left = max(0, int(question_seconds - q_elapsed + 0.999))
-                if seconds_left != last_second:
-                    last_second = seconds_left
-                    if seconds_left <= 0:
-                        break
-                    try:
-                        await bot.edit_message_text(
-                            chat_id=user_id,
-                            message_id=timer_msg.message_id,
-                            text=f"⏳ <b>Qolgan vaqt: {seconds_left} soniya</b>"
-                        )
-                    except Exception:
-                        pass
-
-                if q_elapsed >= question_seconds:
-                    break
-
-            try:
-                await bot.delete_message(chat_id=user_id, message_id=timer_msg.message_id)
-            except Exception:
-                pass
-            try:
-                await bot.delete_message(chat_id=user_id, message_id=q_msg.message_id)
-            except Exception:
-                pass
-            
-            if (datetime.now(timezone.utc) - start_timestamp).total_seconds() >= total_duration_sec:
+            if user_id in user_next_question_flags:
+                user_next_question_flags.pop(user_id, None)
                 break
 
-        async with async_session() as final_session:
-            sess = await final_session.get(TestSession, test_session.id)
-            if sess and sess.status == "IN_PROGRESS":
-                sess.status = "COMPLETED"
-                sess.finished_at = datetime.now(timezone.utc)
-                await calculate_and_save_results(final_session, sess)
-                await final_session.commit()
-                
-                student_obj = await final_session.get(Student, sess.student_id)
-                test_obj = await final_session.get(Test, sess.test_id)
-                if student_obj and test_obj:
-                    save_result_to_sheet(student_obj.student_id, f"{student_obj.first_name} {student_obj.last_name}", student_obj.age or "-", student_obj.school or "-", student_obj.grade or "Barchaga umumiy", test_obj.title, test_obj.subject, sess.score, sess.score_percentage, sess.correct_answers, sess.wrong_answers)
-                
-                await state.clear()
-                main_menu = await get_main_menu_keyboard()
-                await bot.send_message(chat_id=user_id, text=f"🏆 <b>TEST YAKUNLANDI!</b>\n\nNatijangiz: {sess.score} ball ({sess.score_percentage}%).", reply_markup=main_menu)
+            seconds_left = max(0, int(question_seconds - q_elapsed + 0.999))
+            if seconds_left != last_second:
+                last_second = seconds_left
+                if seconds_left <= 0:
+                    break
+                try:
+                    await bot.edit_message_text(
+                        chat_id=user_id,
+                        message_id=timer_msg.message_id,
+                        text=f"⏳ <b>Qolgan vaqt: {seconds_left} soniya</b>"
+                    )
+                except Exception:
+                    pass
+
+            if q_elapsed >= question_seconds:
+                break
+
+        try:
+            await bot.delete_message(chat_id=user_id, message_id=timer_msg.message_id)
+        except Exception:
+            pass
+        try:
+            await bot.delete_message(chat_id=user_id, message_id=q_msg.message_id)
+        except Exception:
+            pass
+
+        if (datetime.now(timezone.utc) - start_timestamp).total_seconds() >= total_duration_sec:
+            break
+
+    async with async_session() as final_session:
+        sess = await final_session.get(TestSession, test_session_id)
+        if sess and sess.status == "IN_PROGRESS":
+            sess.status = "COMPLETED"
+            sess.finished_at = datetime.now(timezone.utc)
+            await calculate_and_save_results(final_session, sess)
+            await final_session.commit()
+
+            student_obj = await final_session.get(Student, sess.student_id)
+            test_obj = await final_session.get(Test, sess.test_id)
+            if student_obj and test_obj:
+                save_result_to_sheet(student_obj.student_id, f"{student_obj.first_name} {student_obj.last_name}", student_obj.age or "-", student_obj.school or "-", student_obj.grade or "Barchaga umumiy", test_obj.title, test_obj.subject, sess.score, sess.score_percentage, sess.correct_answers, sess.wrong_answers)
+
+            await state.clear()
+            main_menu = await get_main_menu_keyboard()
+            await bot.send_message(chat_id=user_id, text=f"🏆 <b>TEST YAKUNLANDI!</b>\n\nNatijangiz: {sess.score} ball ({sess.score_percentage}%).", reply_markup=main_menu)
 
 user_next_question_flags = {}
 
@@ -2009,6 +2204,7 @@ async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     
     asyncio.create_task(reminder_scheduler(bot))
+    asyncio.create_task(block_test_timeout_scheduler(bot))
     
     logging.info("⚙️ Bot to'liq yangilangan tartibda ishga tushdi!")
     await dp.start_polling(bot)
