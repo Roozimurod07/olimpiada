@@ -13,14 +13,8 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-try:
-    from aiogram.fsm.storage.redis import RedisStorage
-    from redis.asyncio import Redis
-except ImportError:
-    RedisStorage = None
-    Redis = None
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, BufferedInputFile
-from sqlalchemy import Column, Integer, String, Text, DateTime, Boolean, ForeignKey, Float, Index, select, update, delete, func, text as sa_text, event
+from sqlalchemy import Column, Integer, String, Text, DateTime, Boolean, ForeignKey, Float, select, update, delete, func, text as sa_text, event
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from sqlalchemy.orm import declarative_base, relationship
 
@@ -82,7 +76,6 @@ class Test(Base):
     mode = Column(String(20), default="global_timer")
     duration_minutes = Column(Integer, default=180)
     question_time_seconds = Column(Integer, default=60)
-    questions_count_to_show = Column(Integer, default=30)  # O'quvchiga nechta savol chiqishi
     is_block_test = Column(Boolean, default=False)
     block_subjects = Column(Text, nullable=True)
     start_time = Column(DateTime, nullable=True)
@@ -123,7 +116,6 @@ class TestSession(Base):
     correct_answers = Column(Integer, default=0)
     wrong_answers = Column(Integer, default=0)
     unanswered = Column(Integer, default=0)
-    selected_question_ids = Column(Text, nullable=True) # O'quvchiga tushgan savollar ID lari (JSON ko'rinishida)
 
     student = relationship("Student", back_populates="test_sessions")
     test = relationship("Test", back_populates="test_sessions")
@@ -159,74 +151,26 @@ class Appeal(Base):
 
 DB_DIR = os.getenv("DB_DIR", ".")
 DB_PATH = os.path.join(DB_DIR, "professional_olimpiada.db")
-DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite+aiosqlite:///{DB_PATH}")
-
-if DATABASE_URL.startswith("postgresql://"):
-    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
-
-if DATABASE_URL.startswith("sqlite"):
-    engine = create_async_engine(
-        DATABASE_URL,
-        echo=False,
-        connect_args={"timeout": 30},
-    )
-else:
-    engine = create_async_engine(
-        DATABASE_URL,
-        echo=False,
-        pool_pre_ping=True,
-        pool_size=int(os.getenv("DB_POOL_SIZE", "20")),
-        max_overflow=int(os.getenv("DB_MAX_OVERFLOW", "40")),
-    )
+engine = create_async_engine(f"sqlite+aiosqlite:///{DB_PATH}", echo=False)
 
 @event.listens_for(engine.sync_engine, "connect")
-def set_db_pragmas(dbapi_connection, connection_record):
-    # SQLite uchun ko'p parallel yozuvlarda ancha barqaror ishlash.
-    if DATABASE_URL.startswith("sqlite"):
-        cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.execute("PRAGMA journal_mode=WAL")
-        cursor.execute("PRAGMA synchronous=NORMAL")
-        cursor.execute("PRAGMA busy_timeout=30000")
-        cursor.close()
+def set_sqlite_pragma(dbapi_connection, connection_record):
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.close()
 
 async_session = async_sessionmaker(engine, expire_on_commit=False)
 
-# 1000 ta testchi uchun har bir foydalanuvchiga alohida CPU loop emas, event ishlatamiz.
-active_question_by_session: dict[int, int] = {}
-answer_events: dict[int, asyncio.Event] = {}
-
-# Telegram Bot API'ga 1000 foydalanuvchi x 1 edit/soniya yuborish xavfli.
-# Default 5 soniya: vaqt server tomonda aniq yuradi, UI esa yengilroq yangilanadi.
-TIMER_UPDATE_INTERVAL = max(1, int(os.getenv("TIMER_UPDATE_INTERVAL", "5")))
-SHEETS_SEMAPHORE = asyncio.Semaphore(max(1, int(os.getenv("SHEETS_CONCURRENCY", "3"))))
-
 async def init_db():
     async with engine.begin() as conn:
-        if DATABASE_URL.startswith("sqlite"):
-            await conn.execute(sa_text("PRAGMA foreign_keys = ON;"))
+        await conn.execute(sa_text("PRAGMA foreign_keys = ON;"))
         await conn.run_sync(Base.metadata.create_all)
-        # Eski bazalarda ham kerakli indekslarni yaratamiz.
-        await conn.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_test_sessions_student_test_status ON test_sessions(student_id, test_id, status)"))
-        await conn.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_test_sessions_test_status_score ON test_sessions(test_id, status, score DESC)"))
-        await conn.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_answers_session_question ON answers(session_id, question_id)"))
-        try:
-            await conn.execute(sa_text("CREATE UNIQUE INDEX IF NOT EXISTS ux_answers_session_question ON answers(session_id, question_id)"))
-        except Exception:
-            pass
         
         try:
-            await conn.execute(sa_text("SELECT questions_count_to_show FROM tests LIMIT 1"))
+            await conn.execute(sa_text("SELECT question_time_seconds FROM tests LIMIT 1"))
         except Exception:
             try:
-                await conn.execute(sa_text("ALTER TABLE tests ADD COLUMN questions_count_to_show INTEGER DEFAULT 30;"))
-            except Exception:
-                pass
-        try:
-            await conn.execute(sa_text("SELECT selected_question_ids FROM test_sessions LIMIT 1"))
-        except Exception:
-            try:
-                await conn.execute(sa_text("ALTER TABLE test_sessions ADD COLUMN selected_question_ids TEXT;"))
+                await conn.execute(sa_text("ALTER TABLE tests ADD COLUMN question_time_seconds INTEGER DEFAULT 60;"))
             except Exception:
                 pass
         
@@ -267,40 +211,30 @@ def get_gspread_sheet():
     client = gspread.authorize(creds)
     return client.open(SHEET_NAME).sheet1
 
-def _save_result_to_sheet_sync(student_id, full_name, age, school, grade, test_title, subject, score, percentage, correct, wrong):
-    sheet = get_gspread_sheet()
-    row_data = [
-        str(student_id), str(full_name), str(age), str(school), str(grade),
-        str(subject), str(test_title), str(score), f"{percentage}%",
-        str(correct), str(wrong), datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    ]
-    sheet.append_row(row_data)
-
-async def save_result_to_sheet(*args):
-    # gspread sinxron kutubxona; event loopni bloklamaslik va 1000 ta
-    # yakunlanishda yuzlab thread ochilmasligi uchun semaphore ishlatamiz.
+def save_result_to_sheet(student_id, full_name, age, school, grade, test_title, subject, score, percentage, correct, wrong):
     try:
-        async with SHEETS_SEMAPHORE:
-            await asyncio.to_thread(_save_result_to_sheet_sync, *args)
+        sheet = get_gspread_sheet()
+        row_data = [
+            str(student_id), str(full_name), str(age), str(school), str(grade),
+            str(subject), str(test_title), str(score), f"{percentage}%",
+            str(correct), str(wrong), datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        ]
+        sheet.append_row(row_data)
     except Exception as e:
-        logging.exception("Google Sheets qo'shish xatosi: %s", e)
+        print(f"❌ Google Sheets qo'shish xatosi: {e}")
 
-def _update_result_in_sheet_sync(student_id, test_title, score, percentage, correct):
-    sheet = get_gspread_sheet()
-    records = sheet.get_all_records()
-    for idx, row in enumerate(records, start=2):
-        if str(row.get("ID")) == str(student_id) and str(row.get("Test")) == str(test_title):
-            sheet.update_cell(idx, 8, str(score))
-            sheet.update_cell(idx, 9, f"{percentage}%")
-            sheet.update_cell(idx, 10, str(correct))
-            break
-
-async def update_result_in_sheet(*args):
+def update_result_in_sheet(student_id, test_title, score, percentage, correct):
     try:
-        async with SHEETS_SEMAPHORE:
-            await asyncio.to_thread(_update_result_in_sheet_sync, *args)
+        sheet = get_gspread_sheet()
+        records = sheet.get_all_records()
+        for idx, row in enumerate(records, start=2):
+            if str(row.get("ID")) == str(student_id) and str(row.get("Test")) == str(test_title):
+                sheet.update_cell(idx, 8, str(score))
+                sheet.update_cell(idx, 9, f"{percentage}%")
+                sheet.update_cell(idx, 10, str(correct))
+                break
     except Exception as e:
-        logging.exception("Google Sheets yangilash xatosi: %s", e)
+        print(f"❌ Google Sheets yangilash xatosi: {e}")
 
 def generate_certificate_pdf(student_name, test_title, subject, score_pct):
     pdf_buffer = io.BytesIO()
@@ -356,7 +290,6 @@ class AdminAddTest(StatesGroup):
     waiting_for_is_block = State()
     waiting_for_block_sub1 = State()
     waiting_for_block_sub2 = State()
-    waiting_for_question_count = State() # Yangi state: Nechta savol tushishi
     waiting_for_question_time = State()
     waiting_for_attempts = State()
     waiting_for_start_time = State()
@@ -379,35 +312,6 @@ class TestProcessState(StatesGroup):
     in_test = State()
 
 router = Router()
-
-# Blok testning qat'iy tarkibi
-BLOCK_SECTIONS = ["Tarix", "Ona tili", "Matematika", "Asosiy fan 1", "Asosiy fan 2"]
-BLOCK_COUNTS = {"Tarix": 10, "Ona tili": 10, "Matematika": 10, "Asosiy fan 1": 30, "Asosiy fan 2": 30}
-BLOCK_POINTS = {"Tarix": 1.1, "Ona tili": 1.1, "Matematika": 1.1, "Asosiy fan 1": 3.1, "Asosiy fan 2": 2.1}
-
-# Blok test runtime holati: fan tanlovi va navbatdagi savol.
-block_question_order = {}
-block_current_section = {}
-
-def get_student_block_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📜 Tarix (10)", callback_data="student_block_sec_Tarix")],
-        [InlineKeyboardButton(text="📝 Ona tili (10)", callback_data="student_block_sec_Ona_tili")],
-        [InlineKeyboardButton(text="➗ Matematika (10)", callback_data="student_block_sec_Matematika")],
-        [InlineKeyboardButton(text="📘 Asosiy fan 1 (30)", callback_data="student_block_sec_Main1")],
-        [InlineKeyboardButton(text="📗 Asosiy fan 2 (30)", callback_data="student_block_sec_Main2")],
-        [InlineKeyboardButton(text="🏁 Testni yakunlash", callback_data="student_block_finish")],
-    ])
-
-def get_block_section_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📜 Tarix — 10", callback_data="admin_block_sec_Tarix")],
-        [InlineKeyboardButton(text="📝 Ona tili — 10", callback_data="admin_block_sec_Ona_tili")],
-        [InlineKeyboardButton(text="➗ Matematika — 10", callback_data="admin_block_sec_Matematika")],
-        [InlineKeyboardButton(text="📘 Asosiy fan 1 — 30", callback_data="admin_block_sec_Main1")],
-        [InlineKeyboardButton(text="📗 Asosiy fan 2 — 30", callback_data="admin_block_sec_Main2")],
-        [InlineKeyboardButton(text="🏁 Savollarni tugatish", callback_data="admin_block_finish")],
-    ])
 
 async def get_main_menu_keyboard():
     keyboard = [
@@ -618,13 +522,7 @@ async def show_test_analysis_for_appeal(callback: CallbackQuery):
             await callback.answer("Bu test uchun hali tahlil ochiq emas!", show_alert=True)
             return
 
-        # O'quvchiga tushgan savollar ID larini olish
-        q_ids = json.loads(ts.selected_question_ids) if ts.selected_question_ids else []
-        questions = (await session.execute(select(Question).where(Question.id.in_(q_ids)))).scalars().all()
-        # Tartibni saqlash uchun
-        q_dict = {q.id: q for q in questions}
-        ordered_questions = [q_dict[qid] for qid in q_ids if qid in q_dict]
-
+        questions = (await session.execute(select(Question).where(Question.test_id == test.id))).scalars().all()
         answers = {a.question_id: a.selected_option for a in (await session.execute(select(Answer).where(Answer.session_id == ts.id))).scalars().all()}
         
         text = f"📋 <b>Test tahlili: {test.subject} ({test.title})</b>\n" \
@@ -632,7 +530,7 @@ async def show_test_analysis_for_appeal(callback: CallbackQuery):
                f"✅ To'g'ri: {ts.correct_answers} | ❌ Noto'g'ri: {ts.wrong_answers} | ⭕ Javobsiz: {ts.unanswered}\n\n"
                
         keyboard = []
-        for idx, q in enumerate(ordered_questions, 1):
+        for idx, q in enumerate(questions, 1):
             sel = answers.get(q.id, "Javob berilmagan")
             status = "✅" if sel == q.correct_option else "❌"
             sec = f"[{q.section_name}] " if q.section_name else ""
@@ -734,21 +632,21 @@ async def start_block_test_prompt(message: Message, state: FSMContext):
 
     async with async_session() as session:
         student = (await session.execute(select(Student).where(Student.telegram_id == message.from_user.id))).scalar_one_or_none()
-        if not student:
-            await message.answer("❌ Ro'yxatdan o'tmagansiz.")
+        if not student or not student.grade:
+            await message.answer("❌ Profilingizda sinf ko'rsatilmagan yoki ro'yxatdan o'tmagansiz.")
             return
 
-        # Blok test barcha sinflar uchun umumiy.
         tests = (await session.execute(
             select(Test).where(
-                Test.is_active == True,
-                Test.is_finished == False,
+                Test.is_active == True, 
+                Test.is_finished == False, 
+                Test.grade_level == student.grade,
                 Test.is_block_test == True
             )
         )).scalars().all()
         
         if not tests:
-            await message.answer("⚠️ Hozirda faol blok testlar mavjud emas.")
+            await message.answer(f"⚠️ Hozirda <b>{student.grade}</b> uchun faol blok testlar mavjud emas.")
             return
 
         keyboard_buttons = [[InlineKeyboardButton(text=f"🧩 {t.subject} — {t.title}", callback_data=f"start_test_{t.id}")] for t in tests]
@@ -756,24 +654,12 @@ async def start_block_test_prompt(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("start_test_"))
 async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bot):
-    try:
-        test_id = int(callback.data.split("_")[2])
-    except (ValueError, IndexError):
-        await callback.answer("❌ Test tugmasi noto'g'ri.", show_alert=True)
-        return
-
-    user_id = callback.from_user.id
-    # Muhim: bu session faqat testni boshlash uchun ishlatiladi.
-    # Endi uni 30-180 daqiqa ochiq ushlab turmaymiz.
+    test_id = int(callback.data.split("_")[2])
+    
     async with async_session() as session:
-        student = (await session.execute(
-            select(Student).where(Student.telegram_id == user_id)
-        )).scalar_one_or_none()
-        test = await session.get(Test, test_id)
-
-        if not student or not student.is_active:
-            await callback.answer("❌ Profil topilmadi yoki bloklangan.", show_alert=True)
-            return
+        student = (await session.execute(select(Student).where(Student.telegram_id == callback.from_user.id))).scalar_one_or_none()
+        test = (await session.execute(select(Test).where(Test.id == test_id))).scalar_one_or_none()
+        
         if not test or not test.is_active or test.is_finished:
             await callback.answer("Bu test topilmadi yoki yopilgan!", show_alert=True)
             return
@@ -782,7 +668,7 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
         if test.start_time:
             start_t = test.start_time.replace(tzinfo=timezone.utc) if test.start_time.tzinfo is None else test.start_time
             if now < start_t:
-                await callback.answer(f"⏳ Test hali boshlanmagan! {start_t.strftime('%Y-%m-%d %H:%M')}", show_alert=True)
+                await callback.answer(f"⏳ Test hali boshlanmagan! Boshlanish vaqti: {start_t.strftime('%Y-%m-%d %H:%M')}", show_alert=True)
                 return
         if test.end_time:
             end_t = test.end_time.replace(tzinfo=timezone.utc) if test.end_time.tzinfo is None else test.end_time
@@ -790,202 +676,96 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
                 await callback.answer("⏰ Bu testning vaqti tugagan!", show_alert=True)
                 return
 
-        # Bir vaqtning o'zida shu testda ikkinchi IN_PROGRESS sessiyani ochishga yo'l qo'ymaymiz.
-        active_count = await session.scalar(select(func.count(TestSession.id)).where(
-            TestSession.student_id == student.id,
-            TestSession.test_id == test_id,
-            TestSession.status == "IN_PROGRESS"
-        ))
-        if active_count:
-            await callback.answer("⚠️ Sizda bu test allaqachon boshlangan.", show_alert=True)
-            return
-
         if test.max_attempts > 0:
-            attempts_count = await session.scalar(select(func.count(TestSession.id)).where(
-                TestSession.student_id == student.id,
-                TestSession.test_id == test_id,
-                TestSession.status == "COMPLETED"
-            ))
+            attempts_count = await session.scalar(
+                select(func.count(TestSession.id)).where(
+                    TestSession.student_id == student.id,
+                    TestSession.test_id == test_id,
+                    TestSession.status == "COMPLETED"
+                )
+            )
             if attempts_count >= test.max_attempts:
                 await callback.answer(f"❌ Urinishlar soni tugagan: {test.max_attempts}", show_alert=True)
                 return
 
-        # Faqat kerakli ustunlarni olib, RAMni ortiqcha to'ldirmaymiz.
-        all_questions = (await session.execute(
-            select(Question).where(Question.test_id == test_id)
-        )).scalars().all()
-        if not all_questions:
+        questions = (await session.execute(select(Question).where(Question.test_id == test_id))).scalars().all()
+        if not questions:
             await callback.answer("Bu testda savollar yo'q!", show_alert=True)
             return
-
-        if test.is_block_test:
-            # Blok testda aynan 10/10/10/30/30 tarkib olinadi.
-            names = json.loads(test.block_subjects or "{}")
-            sub1 = names.get("sub1") or "Asosiy fan 1"
-            sub2 = names.get("sub2") or "Asosiy fan 2"
-            grouped_questions = {
-                "Tarix": [], "Ona tili": [], "Matematika": [],
-                "Asosiy fan 1": [], "Asosiy fan 2": []
-            }
-            for q in all_questions:
-                if q.section_name == sub1:
-                    grouped_questions["Asosiy fan 1"].append(q)
-                elif q.section_name == sub2:
-                    grouped_questions["Asosiy fan 2"].append(q)
-                elif q.section_name in grouped_questions:
-                    grouped_questions[q.section_name].append(q)
-
-            if any(len(grouped_questions[k]) != BLOCK_COUNTS[k] for k in BLOCK_SECTIONS):
-                await callback.answer("❌ Blok test bazasida 10/10/10/30/30 tarkib yo'q.", show_alert=True)
-                return
-
-            # Har bir fandan aynan kerakli savollar olinadi.
-            selected_questions = []
-            for sec in BLOCK_SECTIONS:
-                selected_questions.extend(grouped_questions[sec])
-            # Faqat fan ichida aralashtiramiz; fanlar o'rtasida aralashtirmaymiz.
-            for sec in BLOCK_SECTIONS:
-                start = sum(BLOCK_COUNTS[x] for x in BLOCK_SECTIONS[:BLOCK_SECTIONS.index(sec)])
-                end = start + BLOCK_COUNTS[sec]
-                part = selected_questions[start:end]
-                random.shuffle(part)
-                selected_questions[start:end] = part
-        else:
-            count_to_pick = min(test.questions_count_to_show or 30, len(all_questions))
-            selected_questions = random.sample(all_questions, count_to_pick)
-            random.shuffle(selected_questions)
-
-        selected_q_ids = [q.id for q in selected_questions]
-
-        test_session = TestSession(
-            student_id=student.id,
-            test_id=test_id,
-            status="IN_PROGRESS",
-            started_at=now,
-            selected_question_ids=json.dumps(selected_q_ids),
-        )
+            
+        test_session = TestSession(student_id=student.id, test_id=test_id, status="IN_PROGRESS")
         session.add(test_session)
         await session.commit()
         await session.refresh(test_session)
 
-        if test.is_block_test:
-            # Savollarni 10/10/10/30/30 bo'yicha guruhlaymiz.
-            names=json.loads(test.block_subjects or "{}")
-            sub1=names.get("sub1") or "Asosiy fan 1"
-            sub2=names.get("sub2") or "Asosiy fan 2"
-            grouped={"Tarix":[],"Ona tili":[],"Matematika":[],"Asosiy fan 1":[],"Asosiy fan 2":[]}
-            for q in all_questions:
-                sec=q.section_name
-                if sec==sub1: key="Asosiy fan 1"
-                elif sec==sub2: key="Asosiy fan 2"
-                else: key=sec
-                if key in grouped:
-                    grouped[key].append(q.id)
-            # Savollar oldindan 10/10/10/30/30 tartibida tanlangan.
-            block_question_order[test_session.id] = grouped
-            block_current_section[test_session.id]=None
-            await state.set_state(TestProcessState.in_test)
-            await callback.message.edit_text(
-                "🧩 <b>Blok test boshlandi!</b>\n\n"
-                "⏱ <b>180 daqiqa</b> — barcha 90 ta savol uchun umumiy vaqt.\n"
-                "Istalgan fandan boshlashingiz mumkin.\n\n"
-                "📚 Fan tanlang:",
-                reply_markup=get_student_block_keyboard()
-            )
-            return
-
-        # Keyingi kod DB sessiondan tashqarida ishlaydi.
-        subject = test.subject
-        title = test.title
-        total_duration_sec = max(1, int(test.duration_minutes or 60) * 60)
-        question_seconds = max(1, int(test.question_time_seconds or 60))
-
-    await callback.message.edit_text(
-        f"🚀 <b>{subject} ({title})</b> testi boshlandi!\n"
-        f"Sizga {len(selected_questions)} ta savol tasodifiy taqdim etildi."
-    )
-    await state.set_state(TestProcessState.in_test)
-
-    session_event = asyncio.Event()
-    answer_events[test_session.id] = session_event
-    test_started_at = now
-
-    try:
-        for index, q in enumerate(selected_questions):
-            # Testning umumiy server vaqti tugaganini aniq hisoblaymiz.
-            elapsed_total = (datetime.now(timezone.utc) - test_started_at).total_seconds()
-            remaining_total = total_duration_sec - elapsed_total
-            if remaining_total <= 0:
-                await bot.send_message(user_id, "⏰ Test uchun ajratilgan umumiy vaqt tugadi!")
+        await callback.message.edit_text(f"🚀 <b>{test.subject} ({test.title})</b> testi boshlandi!")
+        user_id = callback.from_user.id
+        await state.set_state(TestProcessState.in_test)
+        
+        total_duration_sec = test.duration_minutes * 60
+        start_timestamp = datetime.now(timezone.utc)
+        
+        for index, q in enumerate(questions):
+            current_test_check = await session.get(Test, test_id)
+            if not current_test_check.is_active or current_test_check.is_finished:
                 break
 
-            async with async_session() as check_session:
-                current_test = await check_session.get(Test, test_id)
-                current_session = await check_session.get(TestSession, test_session.id)
-                if not current_session or current_session.status != "IN_PROGRESS":
-                    break
-                if not current_test or not current_test.is_active or current_test.is_finished:
-                    break
-
-            active_question_by_session[test_session.id] = q.id
-            session_event.clear()
+            elapsed = (datetime.now(timezone.utc) - start_timestamp).total_seconds()
+            if elapsed >= total_duration_sec:
+                await bot.send_message(chat_id=user_id, text="⏰ Test uchun ajratilgan umumiy vaqt tugadi!")
+                break
 
             options = [("A", q.option_a), ("B", q.option_b)]
-            if q.option_c:
-                options.append(("C", q.option_c))
-            if q.option_d:
-                options.append(("D", q.option_d))
-
+            if q.option_c: options.append(("C", q.option_c))
+            if q.option_d: options.append(("D", q.option_d))
+            
             keyboard_buttons = []
             row = []
             for opt_key, text_val in options:
-                row.append(InlineKeyboardButton(
-                    text=f"{opt_key}) {text_val}",
-                    callback_data=f"ans_{test_session.id}_{q.id}_{opt_key}"
-                ))
+                row.append(InlineKeyboardButton(text=f"{opt_key}) {text_val}", callback_data=f"ans_{test_session.id}_{q.id}_{opt_key}"))
                 if len(row) == 2:
                     keyboard_buttons.append(row)
                     row = []
-            if row:
-                keyboard_buttons.append(row)
-
+            if row: keyboard_buttons.append(row)
+            
             markup = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+            
             sec_title = f"<b>Fan / Bo'lim: {q.section_name}</b>\n" if q.section_name else ""
-            text_content = f"{sec_title}<b>Savol {index + 1} / {len(selected_questions)}</b> (Ball: {q.points})\n\n{q.question_text}"
-
+            text_content = f"{sec_title}<b>Savol {index + 1} / {len(questions)}</b> (Ball: {q.points})\n\n{q.question_text}"
+            
             if q.photo_file_id:
-                q_msg = await bot.send_photo(user_id, q.photo_file_id, caption=text_content, reply_markup=markup)
+                q_msg = await bot.send_photo(chat_id=user_id, photo=q.photo_file_id, caption=text_content, reply_markup=markup)
             else:
-                q_msg = await bot.send_message(user_id, text_content, reply_markup=markup)
+                q_msg = await bot.send_message(chat_id=user_id, text=text_content, reply_markup=markup)
 
-            # Timer UI: serverdagi deadline aniq; Telegram limitlari sabab har soniyada edit qilmaymiz.
+            q_start_time = datetime.now(timezone.utc)
+            question_seconds = max(1, int(test.question_time_seconds))
             timer_msg = await bot.send_message(
-                user_id,
-                f"⏳ <b>Qolgan vaqt: {min(question_seconds, int(remaining_total))} soniya</b>"
+                chat_id=user_id,
+                text=f"⏳ <b>Qolgan vaqt: {question_seconds} soniya</b>"
             )
-            question_started_at = datetime.now(timezone.utc)
-            deadline = question_started_at + timedelta(seconds=min(question_seconds, remaining_total))
-            last_displayed = None
+            last_second = question_seconds
+
+            user_next_question_flags.pop(user_id, None)
 
             while True:
-                now_loop = datetime.now(timezone.utc)
-                remaining_q = max(0.0, (deadline - now_loop).total_seconds())
-                remaining_total = max(0.0, total_duration_sec - (now_loop - test_started_at).total_seconds())
+                await asyncio.sleep(0.2)
+                now = datetime.now(timezone.utc)
+                total_elapsed = (now - start_timestamp).total_seconds()
+                q_elapsed = (now - q_start_time).total_seconds()
 
-                if session_event.is_set() or remaining_q <= 0 or remaining_total <= 0:
+                if total_elapsed >= total_duration_sec:
                     break
 
-                # Bir taskda faqat bitta timer sleep; 0.2 sekundlik 1000 ta loop yo'q.
-                sleep_for = min(TIMER_UPDATE_INTERVAL, remaining_q, remaining_total)
-                try:
-                    await asyncio.wait_for(session_event.wait(), timeout=max(0.05, sleep_for))
+                if user_id in user_next_question_flags:
+                    user_next_question_flags.pop(user_id, None)
                     break
-                except asyncio.TimeoutError:
-                    pass
 
-                seconds_left = max(0, int((deadline - datetime.now(timezone.utc)).total_seconds() + 0.999))
-                if seconds_left != last_displayed and seconds_left > 0:
-                    last_displayed = seconds_left
+                seconds_left = max(0, int(question_seconds - q_elapsed + 0.999))
+                if seconds_left != last_second:
+                    last_second = seconds_left
+                    if seconds_left <= 0:
+                        break
                     try:
                         await bot.edit_message_text(
                             chat_id=user_id,
@@ -995,18 +775,21 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
                     except Exception:
                         pass
 
-            # Savolni tugatishdan oldin timer va savolni tozalaymiz.
-            for msg_id in (timer_msg.message_id, q_msg.message_id):
-                try:
-                    await bot.delete_message(user_id, msg_id)
-                except Exception:
-                    pass
+                if q_elapsed >= question_seconds:
+                    break
 
-            if remaining_total <= 0:
-                await bot.send_message(user_id, "⏰ Test uchun ajratilgan umumiy vaqt tugadi!")
+            try:
+                await bot.delete_message(chat_id=user_id, message_id=timer_msg.message_id)
+            except Exception:
+                pass
+            try:
+                await bot.delete_message(chat_id=user_id, message_id=q_msg.message_id)
+            except Exception:
+                pass
+            
+            if (datetime.now(timezone.utc) - start_timestamp).total_seconds() >= total_duration_sec:
                 break
 
-        # Natijani faqat bir marta, transaction ichida saqlaymiz.
         async with async_session() as final_session:
             sess = await final_session.get(TestSession, test_session.id)
             if sess and sess.status == "IN_PROGRESS":
@@ -1014,244 +797,50 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
                 sess.finished_at = datetime.now(timezone.utc)
                 await calculate_and_save_results(final_session, sess)
                 await final_session.commit()
-
+                
                 student_obj = await final_session.get(Student, sess.student_id)
                 test_obj = await final_session.get(Test, sess.test_id)
-                result_data = None
                 if student_obj and test_obj:
-                    result_data = (
-                        student_obj.student_id,
-                        f"{student_obj.first_name} {student_obj.last_name}",
-                        student_obj.age or "-", student_obj.school or "-", student_obj.grade or "-",
-                        test_obj.title, test_obj.subject, sess.score, sess.score_percentage,
-                        sess.correct_answers, sess.wrong_answers
-                    )
-                result_text = f"🏆 <b>TEST YAKUNLANDI!</b>\n\nNatijangiz: {sess.score} ball ({sess.score_percentage}%)."
-            else:
-                result_data = None
-                result_text = "ℹ️ Test sessiyasi allaqachon yakunlangan."
+                    save_result_to_sheet(student_obj.student_id, f"{student_obj.first_name} {student_obj.last_name}", student_obj.age or "-", student_obj.school or "-", student_obj.grade or "-", test_obj.title, test_obj.subject, sess.score, sess.score_percentage, sess.correct_answers, sess.wrong_answers)
+                
+                await state.clear()
+                main_menu = await get_main_menu_keyboard()
+                await bot.send_message(chat_id=user_id, text=f"🏆 <b>TEST YAKUNLANDI!</b>\n\nNatijangiz: {sess.score} ball ({sess.score_percentage}%).", reply_markup=main_menu)
 
-        if result_data:
-            # Google Sheets asosiy natija emas; u alohida background task.
-            asyncio.create_task(save_result_to_sheet(*result_data))
-
-        await state.clear()
-        await bot.send_message(user_id, result_text, reply_markup=await get_main_menu_keyboard())
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        logging.exception("Test sessiyasi xatosi: session_id=%s", test_session.id)
-        # Bot xatoda ham sessiyani osilib qolgan holatda qoldirmaydi.
-        async with async_session() as session:
-            sess = await session.get(TestSession, test_session.id)
-            if sess and sess.status == "IN_PROGRESS":
-                sess.status = "COMPLETED"
-                sess.finished_at = datetime.now(timezone.utc)
-                await calculate_and_save_results(session, sess)
-                await session.commit()
-        await state.clear()
-        await bot.send_message(user_id, "⚠️ Testda texnik xatolik yuz berdi. Saqlangan javoblaringiz bo'yicha natija hisoblandi.", reply_markup=await get_main_menu_keyboard())
-    finally:
-        active_question_by_session.pop(test_session.id, None)
-        answer_events.pop(test_session.id, None)
-
-async def show_block_question(session_id:int, user_id:int, section:str, bot:Bot):
-    async with async_session() as session:
-        ts=await session.get(TestSession,session_id)
-        if not ts or ts.status!="IN_PROGRESS": return
-        started=ts.started_at.replace(tzinfo=timezone.utc) if ts.started_at.tzinfo is None else ts.started_at
-        remaining=180*60-(datetime.now(timezone.utc)-started).total_seconds()
-        if remaining<=0:
-            ts.status="COMPLETED"; ts.finished_at=datetime.now(timezone.utc)
-            await calculate_and_save_results(session,ts); await session.commit()
-            block_question_order.pop(session_id,None); block_current_section.pop(session_id,None)
-            await bot.send_message(user_id,"⏰ 180 daqiqalik umumiy vaqt tugadi.")
-            return
-        qids=block_question_order.get(session_id,{}).get(section,[])
-        answered={a.question_id for a in (await session.execute(select(Answer).where(Answer.session_id==session_id))).scalars().all()}
-        qid=next((x for x in qids if x not in answered),None)
-        if qid is None:
-            await bot.send_message(user_id,f"✅ {section} bo'limi tugadi.",reply_markup=get_student_block_keyboard())
-            return
-        q=await session.get(Question,qid)
-    block_current_section[session_id]=section
-    active_question_by_session[session_id]=qid
-    rem=max(0,int(remaining))
-    h,rem2=divmod(rem,3600); m,sec=divmod(rem2,60)
-    opts=[("A",q.option_a),("B",q.option_b),("C",q.option_c),("D",q.option_d)]
-    opts=[x for x in opts if x[1]]
-    kb=[[InlineKeyboardButton(text=f"{k}) {v}",callback_data=f"ans_{session_id}_{q.id}_{k}")] for k,v in opts]
-    kb.append([InlineKeyboardButton(text="📚 Fanlar",callback_data=f"student_block_menu_{session_id}")])
-    text=f"🧩 <b>{section}</b>\n⏱ Qolgan vaqt: <b>{h:02d}:{m:02d}:{sec:02d}</b>\n\n<b>Savol</b>\n{q.question_text}"
-    if q.photo_file_id:
-        await bot.send_photo(user_id,q.photo_file_id,caption=text,reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
-    else:
-        await bot.send_message(user_id,text,reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
-
-@router.callback_query(F.data.startswith("student_block_sec_"))
-async def student_choose_block_section(callback:CallbackQuery, bot:Bot):
-    key=callback.data[len("student_block_sec_"):]
-    section={"Tarix":"Tarix","Ona_tili":"Ona tili","Matematika":"Matematika","Main1":"Asosiy fan 1","Main2":"Asosiy fan 2"}.get(key)
-    if not section: return
-    async with async_session() as session:
-        student=(await session.execute(select(Student).where(Student.telegram_id==callback.from_user.id))).scalar_one_or_none()
-        if not student: return
-        ts=(await session.execute(select(TestSession).where(TestSession.student_id==student.id,TestSession.status=="IN_PROGRESS").order_by(TestSession.id.desc()))).scalars().first()
-        if not ts or ts.id not in block_question_order:
-            await callback.answer("Faol blok test topilmadi.",show_alert=True); return
-        session_id=ts.id
-    await callback.answer()
-    await callback.message.delete()
-    await show_block_question(session_id,callback.from_user.id,section,bot)
-
-@router.callback_query(F.data.startswith("student_block_menu_"))
-async def student_block_menu(callback:CallbackQuery):
-    await callback.message.edit_text("📚 <b>Istalgan fandan davom eting:</b>",reply_markup=get_student_block_keyboard())
-    await callback.answer()
-
-@router.callback_query(F.data=="student_block_finish")
-async def student_block_finish(callback:CallbackQuery, bot:Bot):
-    async with async_session() as session:
-        student=(await session.execute(select(Student).where(Student.telegram_id==callback.from_user.id))).scalar_one_or_none()
-        if not student: return
-        ts=(await session.execute(select(TestSession).where(TestSession.student_id==student.id,TestSession.status=="IN_PROGRESS").order_by(TestSession.id.desc()))).scalars().first()
-        if not ts or ts.id not in block_question_order:
-            await callback.answer("Faol blok test topilmadi.",show_alert=True); return
-        ts.status="COMPLETED"; ts.finished_at=datetime.now(timezone.utc)
-        await calculate_and_save_results(session,ts); await session.commit()
-        result=f"🏆 <b>Blok test yakunlandi!</b>\n\nNatijangiz: <b>{ts.score} ball ({ts.score_percentage}%)</b>"
-    block_question_order.pop(ts.id,None); block_current_section.pop(ts.id,None); active_question_by_session.pop(ts.id,None)
-    await callback.message.edit_text(result)
-    await callback.answer()
+user_next_question_flags = {}
 
 @router.callback_query(F.data.startswith("ans_"))
 async def save_answer(callback: CallbackQuery, bot: Bot):
-    try:
-        parts = callback.data.split("_")
-        session_id, question_id, selected = int(parts[1]), int(parts[2]), parts[3].upper()
-    except (ValueError, IndexError):
-        await callback.answer("❌ Javob tugmasi noto'g'ri.", show_alert=True)
-        return
-
-    if session_id in block_question_order:
-        async with async_session() as session:
-            ts=await session.get(TestSession,session_id)
-            if not ts or ts.status!="IN_PROGRESS":
-                await callback.answer("⏰ Test sessiyasi faol emas.",show_alert=True); return
-            student=await session.get(Student,ts.student_id)
-            if not student or student.telegram_id!=callback.from_user.id:
-                await callback.answer("❌ Bu savol sizga tegishli emas.",show_alert=True); return
-            if active_question_by_session.get(session_id)!=question_id:
-                await callback.answer("⚠️ Bu savol faol emas.",show_alert=True); return
-            q=await session.get(Question,question_id)
-            if not q or q.test_id!=ts.test_id:
-                await callback.answer("❌ Savol topilmadi.",show_alert=True); return
-            existing=(await session.execute(select(Answer).where(Answer.session_id==session_id,Answer.question_id==question_id))).scalar_one_or_none()
-            if existing: existing.selected_option=selected
-            else: session.add(Answer(session_id=session_id,question_id=question_id,selected_option=selected))
-            await session.commit()
-        section=block_current_section.get(session_id)
-        active_question_by_session.pop(session_id,None)
-        await callback.answer(f"Tanlandi: {selected}")
-        await callback.message.delete()
-        await show_block_question(session_id,callback.from_user.id,section,bot)
-        return
-
-    event_to_wake = None
+    parts = callback.data.split("_")
+    session_id, question_id, selected = int(parts[1]), int(parts[2]), parts[3]
     async with async_session() as session:
-        test_session = await session.get(TestSession, session_id)
-        if not test_session or test_session.status != "IN_PROGRESS":
-            await callback.answer("⏰ Bu test sessiyasi faol emas.", show_alert=True)
-            return
-
-        student = await session.get(Student, test_session.student_id)
-        if not student or student.telegram_id != callback.from_user.id:
-            await callback.answer("❌ Bu savol sizga tegishli emas.", show_alert=True)
-            return
-
-        active_q = active_question_by_session.get(session_id)
-        if active_q is not None and active_q != question_id:
-            await callback.answer("⚠️ Bu savol uchun vaqt tugagan yoki keyingi savol berilgan.", show_alert=True)
-            return
-
-        question = await session.get(Question, question_id)
-        if not question or question.test_id != test_session.test_id:
-            await callback.answer("❌ Savol topilmadi.", show_alert=True)
-            return
-
-        # Bir savolga qayta bosilsa javobni yangilaymiz.
-        existing = (await session.execute(
-            select(Answer).where(Answer.session_id == session_id, Answer.question_id == question_id)
-        )).scalar_one_or_none()
-        if existing:
-            existing.selected_option = selected
-        else:
-            session.add(Answer(session_id=session_id, question_id=question_id, selected_option=selected))
+        existing = (await session.execute(select(Answer).where(Answer.session_id == session_id, Answer.question_id == question_id))).scalar_one_or_none()
+        if existing: existing.selected_option = selected
+        else: session.add(Answer(session_id=session_id, question_id=question_id, selected_option=selected))
         await session.commit()
-        event_to_wake = answer_events.get(session_id)
 
-    if event_to_wake:
-        event_to_wake.set()
+    user_next_question_flags[callback.from_user.id] = {"target_index": None}
     await callback.answer(f"Tanlandi: {selected}")
 
 async def calculate_and_save_results(session, sess: TestSession):
-    # Faqat o'quvchiga tushgan savollar bo'yicha hisoblaymiz.
-    q_ids = json.loads(sess.selected_question_ids) if sess.selected_question_ids else []
-    questions = (await session.execute(
-        select(Question).where(Question.id.in_(q_ids))
-    )).scalars().all()
-
-    answers = {
-        a.question_id: a.selected_option
-        for a in (
-            await session.execute(
-                select(Answer).where(Answer.session_id == sess.id)
-            )
-        ).scalars().all()
-    }
-
-    # Blok test: Tarix/Ona tili/Matematika = 1.1,
-    # Asosiy fan 1 = 3.1, Asosiy fan 2 = 2.1.
-    # Maksimal jami: 189 ball.
-    block_points = {
-        "Tarix": 1.1,
-        "Ona tili": 1.1,
-        "Matematika": 1.1,
-        "Asosiy fan 1": 3.1,
-        "Asosiy fan 2": 2.1,
-    }
-
-    test = await session.get(Test, sess.test_id)
-    is_block = bool(test and test.is_block_test)
-
-    correct, wrong, unanswered = 0, 0, 0
-    total_score = 0.0
-
+    questions = (await session.execute(select(Question).where(Question.test_id == sess.test_id))).scalars().all()
+    answers = {a.question_id: a.selected_option for a in (await session.execute(select(Answer).where(Answer.session_id == sess.id))).scalars().all()}
+    
+    correct, wrong, unanswered, total_score = 0, 0, 0, 0.0
     for q in questions:
         sel = answers.get(q.id)
-        if not sel:
-            unanswered += 1
+        if not sel: unanswered += 1
         elif sel == q.correct_option:
             correct += 1
-            total_score += (
-                block_points.get(q.section_name, 0.0)
-                if is_block else q.points
-            )
-        else:
-            wrong += 1
-
+            total_score += q.points
+        else: wrong += 1
+            
     total_q = len(questions)
     sess.correct_answers = correct
     sess.wrong_answers = wrong
     sess.unanswered = unanswered
     sess.score = round(total_score, 2)
-
-    if is_block:
-        sess.score_percentage = round((total_score / 189.0) * 100, 2)
-    else:
-        sess.score_percentage = (
-            round((correct / total_q) * 100, 2) if total_q > 0 else 0.0
-        )
+    sess.score_percentage = round((correct / total_q) * 100, 2) if total_q > 0 else 0.0
 
 @router.message(F.text == "🏆 Reyting")
 async def rating_menu_prompt(message: Message, state: FSMContext):
@@ -1462,11 +1051,7 @@ async def admin_session_question_analysis(callback: CallbackQuery):
         test = await session.get(Test, ts.test_id)
         student = await session.get(Student, ts.student_id)
         
-        q_ids = json.loads(ts.selected_question_ids) if ts.selected_question_ids else []
-        questions = (await session.execute(select(Question).where(Question.id.in_(q_ids)))).scalars().all()
-        q_dict = {q.id: q for q in questions}
-        ordered_questions = [q_dict[qid] for qid in q_ids if qid in q_dict]
-
+        questions = (await session.execute(select(Question).where(Question.test_id == test.id))).scalars().all()
         answers = {a.question_id: a.selected_option for a in (await session.execute(select(Answer).where(Answer.session_id == ts.id))).scalars().all()}
         
         text = f"📋 <b>{student.first_name} {student.last_name} ning test natijasi</b>\n" \
@@ -1474,7 +1059,7 @@ async def admin_session_question_analysis(callback: CallbackQuery):
                f"⭐ Ball: {ts.score} ({ts.score_percentage}%)\n" \
                f"✅ To'g'ri: {ts.correct_answers} | ❌ Noto'g'ri: {ts.wrong_answers} | ⭕ Javobsiz: {ts.unanswered}\n\n"
                
-        for idx, q in enumerate(ordered_questions, 1):
+        for idx, q in enumerate(questions, 1):
             sel = answers.get(q.id, "Javob berilmagan")
             status = "✅" if sel == q.correct_option else "❌"
             sec = f"[{q.section_name}] " if q.section_name else ""
@@ -1489,7 +1074,7 @@ async def admin_session_question_analysis(callback: CallbackQuery):
 @router.message(F.text == "ℹ️ Olimpiada haqida")
 async def about_handler(message: Message, state: FSMContext):
     if await state.get_state() == TestProcessState.in_test.state: return
-    await message.answer("ℹ️ Professional Olimpiada Tizimi v3.2 — Tasodifiy savollar va har bir o'quvchiga alohida variantlar.")
+    await message.answer("ℹ️ Professional Olimpiada Tizimi v3.1 — Har bir savol uchun vaqt sozlamasi va DTM blok testlar.")
 
 @router.message(Command("admin"))
 async def admin_panel(message: Message, state: FSMContext):
@@ -1567,23 +1152,8 @@ async def admin_get_title(message: Message, state: FSMContext):
     await state.update_data(title=message.text.strip())
     data = await state.get_data()
     if data.get("is_block"):
-        # BLOK TEST: sinf umuman ishlatilmaydi.
-        # U barcha o'quvchilar uchun umumiy bo'ladi.
-        await state.update_data(
-            subject="Blok Test",
-            grade="ALL",
-            questions_count_to_show=90,
-            duration_minutes=180,
-            question_time_seconds=None,
-        )
-        await state.set_state(AdminAddTest.waiting_for_block_sub1)
-        await message.answer(
-            "🧩 <b>Blok test barcha sinflar uchun umumiy.</b>\n\n"
-            "❌ Sinf so'ralmaydi.\n"
-            "⏱ Umumiy vaqt: <b>180 daqiqa</b>.\n"
-            "🔢 Jami: <b>90 ta savol</b>.\n\n"
-            "📘 1-asosiy fanning nomini kiriting:"
-        )
+        await state.set_state(AdminAddTest.waiting_for_grade)
+        await message.answer("Sinfni kiriting (masalan: `11-sinf`):")
     else:
         await state.set_state(AdminAddTest.waiting_for_subject)
         await message.answer("Fan nomini kiriting:")
@@ -1596,17 +1166,14 @@ async def admin_get_subject(message: Message, state: FSMContext):
 
 @router.message(AdminAddTest.waiting_for_grade)
 async def admin_get_grade(message: Message, state: FSMContext):
+    await state.update_data(grade=message.text.strip())
     data = await state.get_data()
     if data.get("is_block"):
-        # Himoya: blok test bu state'ga hech qachon sinf so'ramasdan o'tishi kerak.
-        await state.update_data(grade="ALL", subject="Blok Test", duration_minutes=180, question_time_seconds=None)
         await state.set_state(AdminAddTest.waiting_for_block_sub1)
-        await message.answer("🧩 Blok test barcha sinflar uchun umumiy.\n\n📘 1-asosiy fanning nomini kiriting:")
-        return
-    await state.update_data(grade=message.text.strip())
-    if not data.get("is_block"):
-        await state.set_state(AdminAddTest.waiting_for_question_count)
-        await message.answer("🎯 O'quvchiga nechta savol tasodifiy tushishini kiriting (masalan: <code>30</code>):")
+        await message.answer("1-asosiy fanning nomini kiriting (masalan: Matematika yoki Fizika):")
+    else:
+        await state.set_state(AdminAddTest.waiting_for_question_time)
+        await message.answer("⏱ Har bir test (savol) uchun o'quvchiga beriladigan vaqtni **soniyada** kiriting (masalan: `45` yoki `60`):")
 
 @router.message(AdminAddTest.waiting_for_block_sub1)
 async def admin_get_block_sub1(message: Message, state: FSMContext):
@@ -1617,25 +1184,8 @@ async def admin_get_block_sub1(message: Message, state: FSMContext):
 @router.message(AdminAddTest.waiting_for_block_sub2)
 async def admin_get_block_sub2(message: Message, state: FSMContext):
     await state.update_data(block_sub2=message.text.strip())
-    # Blok testda savollar soni qat'iy 90 ta, vaqt esa umumiy 180 daqiqa.
-    await state.update_data(
-        questions_count_to_show=90,
-        question_time_seconds=None,
-        duration_minutes=180
-    )
-    await state.set_state(AdminAddTest.waiting_for_attempts)
-    await message.answer("🔢 Maksimal urinishlar sonini kiriting (masalan: 1):")
-
-@router.message(AdminAddTest.waiting_for_question_count)
-async def admin_get_question_count(message: Message, state: FSMContext):
-    try:
-        q_count = int(message.text.strip())
-        if q_count <= 0: q_count = 30
-    except:
-        q_count = 30
-    await state.update_data(questions_count_to_show=q_count)
     await state.set_state(AdminAddTest.waiting_for_question_time)
-    await message.answer("⏱ Har bir test (savol) uchun o'quvchiga beriladigan vaqtni **soniyada** kiriting (masalan: `45` yoki `60`):")
+    await message.answer("⏱ Har bir test (savol) uchun o'quvchiga beriladigan vaqtni **soniyada** kiriting (masalan: `60`):")
 
 @router.message(AdminAddTest.waiting_for_question_time)
 async def admin_get_question_time(message: Message, state: FSMContext):
@@ -1671,60 +1221,12 @@ async def admin_get_start_time(message: Message, state: FSMContext):
     data = await state.get_data()
     if data.get("is_block"):
         await message.answer(
-            "🧩 <b>Blok test savollarini fanlar bo'yicha alohida yuklang.</b>\n\n"
-            "📜 Tarix — 10 ta\n📝 Ona tili — 10 ta\n➗ Matematika — 10 ta\n"
-            "📘 Asosiy fan 1 — 30 ta\n📗 Asosiy fan 2 — 30 ta\n\n"
-            "Avval fan tugmasini bosing, keyin shu fanning savollarini yuboring.",
-            reply_markup=get_block_section_keyboard()
+            "🧩 <b>Blok test uchun savollarni yuboring:</b>\n"
+            "Tartib bo'yicha: \n1) Tarix (10 ta)\n2) Ona tili (10 ta)\n3) Matematika (10 ta)\n4) 1-asosiy fan (30 ta)\n5) 2-asosiy fan (30 ta)\n\n"
+            "Matn yoki Word/PDF fayl ko'rinishida yuborishingiz mumkin.", reply_markup=get_finish_test_keyboard()
         )
     else:
-        await message.answer("📂 Barcha savollarni matn yoki Word/PDF fayl ko'rinishida yuborishingiz mumkin (masalan, 100 ta savol).", reply_markup=get_finish_test_keyboard())
-
-@router.callback_query(F.data.startswith("admin_block_sec_"))
-async def admin_choose_block_section(callback: CallbackQuery, state: FSMContext):
-    if not await is_admin(callback.from_user.id):
-        return
-    data = await state.get_data()
-    if not data.get("is_block"):
-        return
-    key=callback.data[len("admin_block_sec_"):]
-    section={"Tarix":"Tarix","Ona_tili":"Ona tili","Matematika":"Matematika",
-             "Main1":"Asosiy fan 1","Main2":"Asosiy fan 2"}.get(key)
-    if not section:
-        await callback.answer("Fan topilmadi.", show_alert=True); return
-    await state.update_data(current_block_section=section)
-    await callback.message.answer(
-        f"📚 <b>{section}</b> tanlandi. {BLOCK_COUNTS[section]} ta savol yuboring.\n"
-        "Rasm + caption, matn yoki Word/PDF yuborishingiz mumkin.",
-        reply_markup=get_block_section_keyboard()
-    )
-    await callback.answer()
-
-@router.callback_query(F.data == "admin_block_finish")
-async def admin_block_finish(callback: CallbackQuery, state: FSMContext):
-    if not await is_admin(callback.from_user.id):
-        return
-    data=await state.get_data()
-    questions=data.get("questions",[])
-    counts={sec:sum(1 for q in questions if q.get("block_section")==sec) for sec in BLOCK_SECTIONS}
-    bad=[f"{sec}: {counts[sec]}/{BLOCK_COUNTS[sec]}" for sec in BLOCK_SECTIONS if counts[sec]!=BLOCK_COUNTS[sec]]
-    if bad:
-        await callback.answer("Savollar soni noto'g'ri.", show_alert=True)
-        await callback.message.answer("❌ Blok test saqlanmaydi:\n"+"\n".join(bad))
-        return
-    # Javoblar hamisha bir xil, aniq tartibda bo'lishi uchun savollarni bo'limlar bo'yicha qayta tartiblaymiz.
-    ordered_questions=[]
-    for sec in BLOCK_SECTIONS:
-        ordered_questions.extend([q for q in questions if q.get("block_section")==sec])
-    await state.update_data(questions=ordered_questions)
-
-    await state.set_state(AdminAddTest.waiting_for_answers)
-    await callback.message.answer(
-        "🔑 90 ta savol uchun to'g'ri javoblarni ketma-ket yuboring (A B C D ...).\n"
-        "Tartib: Tarix 10 → Ona tili 10 → Matematika 10 → Asosiy fan 1 30 → Asosiy fan 2 30.",
-        reply_markup=get_admin_menu()
-    )
-    await callback.answer()
+        await message.answer("📂 Savollarni matn yoki Word/PDF fayl ko'rinishida yuborishingiz mumkin.", reply_markup=get_finish_test_keyboard())
 
 @router.message(AdminAddTest.waiting_for_questions, F.photo)
 async def admin_handle_photo_question(message: Message, state: FSMContext):
@@ -1737,19 +1239,9 @@ async def admin_handle_photo_question(message: Message, state: FSMContext):
     parsed = parse_single_question_text(caption)
     if parsed:
         parsed["photo_file_id"] = photo_id
-        if data.get("is_block"):
-            section=data.get("current_block_section")
-            if not section:
-                await message.answer("❌ Avval fan bo'limini tanlang.")
-                return
-            current=sum(1 for q in q_list if q.get("block_section")==section)
-            if current >= BLOCK_COUNTS[section]:
-                await message.answer(f"⚠️ {section} uchun {BLOCK_COUNTS[section]} ta savol allaqachon yuklangan.")
-                return
-            parsed["block_section"]=section
         q_list.append(parsed)
         await state.update_data(questions=q_list)
-        await message.answer(f"📸 Rasmli savol qo'shildi! Jami yuklangan savollar: {len(q_list)}")
+        await message.answer(f"📸 Rasmli savol qo'shildi! Jami savollar: {len(q_list)}")
     else:
         await message.answer("❌ Rasm tagiga savol va variantlarni (A, B, C, D) to'g'ri formatda yozing!")
 
@@ -1778,7 +1270,7 @@ async def admin_handle_document(message: Message, state: FSMContext, bot: Bot):
         
     added = await parse_and_add_questions(extracted_text, state)
     data = await state.get_data()
-    await message.answer(f"✅ Fayldan {added} ta savol qo'shildi! Jami yuklangan: {len(data.get('questions', []))}")
+    await message.answer(f"✅ Fayldan {added} ta savol qo'shildi! Jami: {len(data.get('questions', []))}")
 
 @router.message(AdminAddTest.waiting_for_questions, F.text == "✅ Testni yakunlash va saqlash")
 async def admin_ask_for_answers(message: Message, state: FSMContext):
@@ -1787,240 +1279,92 @@ async def admin_ask_for_answers(message: Message, state: FSMContext):
     if not data.get("questions"):
         await message.answer("❌ Savollar mavjud emas!")
         return
-    if data.get("is_block"):
-        counts={sec:sum(1 for q in data.get("questions",[]) if q.get("block_section")==sec) for sec in BLOCK_SECTIONS}
-        bad=[f"{sec}: {counts[sec]}/{BLOCK_COUNTS[sec]}" for sec in BLOCK_SECTIONS if counts[sec]!=BLOCK_COUNTS[sec]]
-        if bad:
-            await message.answer("❌ Blok test uchun sonlar noto'g'ri:\n"+"\n".join(bad))
-            return
     await state.set_state(AdminAddTest.waiting_for_answers)
-    await message.answer(f"🔑 Jami {len(data.get('questions'))} ta savol uchun to'g'ri javoblarni ketma-ketlikda yuboring (masalan: `A B C D A...`):", reply_markup=get_admin_menu())
+    await message.answer("🔑 To'g'ri javoblarni ketma-ketlikda yuboring (masalan: `A B C D A...`):", reply_markup=get_admin_menu())
 
 @router.message(AdminAddTest.waiting_for_questions, F.text)
 async def admin_add_bulk_questions_text(message: Message, state: FSMContext):
     if not await is_admin(message.from_user.id): return
     added = await parse_and_add_questions(message.text, state)
     data = await state.get_data()
-    await message.answer(f"✅ {added} ta savol qo'shildi! Jami yuklangan: {len(data.get('questions', []))}")
+    await message.answer(f"✅ {added} ta savol qo'shildi! Jami: {len(data.get('questions', []))}")
 
-def _clean_question_number(text: str) -> str:
-    return re.sub(r"^\s*\d+\s*[\.\):-]\s*", "", text.strip())
+def parse_single_question_text(text: str) -> dict:
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    a_idx, b_idx, c_idx, d_idx = -1, -1, -1, -1
+    for j in range(len(lines)):
+        l = lines[j].lower()
+        if l.startswith("a)") or l.startswith("a."): a_idx = j
+        elif l.startswith("b)") or l.startswith("b."): b_idx = j
+        elif l.startswith("c)") or l.startswith("c."): c_idx = j
+        elif l.startswith("d)") or l.startswith("d."): d_idx = j
 
-
-def _parse_question_block(block: str) -> dict | None:
-    """
-    Parse one complete question block. Variant markers must be at the
-    beginning of a line, so letters inside normal text never become options.
-    """
-    lines = [line.strip() for line in block.replace("\r", "").split("\n") if line.strip()]
-    if not lines:
-        return None
-
-    option_positions = {}
-    for idx, line in enumerate(lines):
-        m = re.match(r"^([A-Da-d])[\.\)]\s*(.*)$", line)
-        if m and m.group(1).upper() not in option_positions:
-            option_positions[m.group(1).upper()] = (idx, m.group(2).strip())
-
-    if "A" not in option_positions or "B" not in option_positions:
-        return None
-
-    a_idx = option_positions["A"][0]
-    b_idx = option_positions["B"][0]
-    c_idx = option_positions.get("C", (None, "C"))[0]
-    d_idx = option_positions.get("D", (None, "D"))[0]
-
-    positions = [a_idx, b_idx]
-    if c_idx is not None:
-        positions.append(c_idx)
-    if d_idx is not None:
-        positions.append(d_idx)
-
-    if positions != sorted(positions):
-        return None
-
-    question_text = " ".join(_clean_question_number(x) for x in lines[:a_idx]).strip()
-    if not question_text:
-        return None
-
-    return {
-        "text": question_text,
-        "a": option_positions["A"][1] or "A",
-        "b": option_positions["B"][1] or "B",
-        "c": option_positions.get("C", (None, "C"))[1] or "C",
-        "d": option_positions.get("D", (None, "D"))[1] or "D",
-        "correct": "A",
-        "photo_file_id": None,
-    }
-
-
-def parse_single_question_text(text: str) -> dict | None:
-    return _parse_question_block(text)
-
-
-def _split_question_blocks(text: str) -> list[str]:
-    """
-    Supports both:
-      1. Question...
-      A) ...
-      B) ...
-      C) ...
-      D) ...
-
-    and the same format without question numbers.
-
-    The important difference from the old parser is that it does NOT assume
-    A/B/C/D must appear within the next 8 lines. Long questions and multi-line
-    questions therefore remain intact.
-    """
-    normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
-    if not normalized:
-        return []
-
-    lines = normalized.split("\n")
-
-    # First try numbered questions. This is the safest format for bulk uploads.
-    number_positions = [
-        idx for idx, line in enumerate(lines)
-        if re.match(r"^\s*\d+\s*[\.\):-]\s*", line)
-    ]
-
-    blocks = []
-    if len(number_positions) >= 2:
-        for pos, next_pos in zip(number_positions, number_positions[1:] + [len(lines)]):
-            block = "\n".join(lines[pos:next_pos]).strip()
-            if block:
-                blocks.append(block)
-        # If numbered parsing produced valid question blocks, use them.
-        if sum(1 for b in blocks if _parse_question_block(b)) > 0:
-            return blocks
-
-    # Unnumbered format: each question begins after the previous D/C/B option.
-    # We identify every A) marker and use the text since the previous option block.
-    a_positions = [
-        idx for idx, line in enumerate(lines)
-        if re.match(r"^\s*[Aa][\.\)]\s*", line)
-    ]
-
-    if not a_positions:
-        return [normalized]
-
-    # Locate the end of each question by finding D) after its A).
-    for idx, a_pos in enumerate(a_positions):
-        # The next A) is a hard boundary if D) was omitted.
-        end_limit = a_positions[idx + 1] if idx + 1 < len(a_positions) else len(lines)
-        d_pos = None
-        for j in range(a_pos + 1, end_limit):
-            if re.match(r"^\s*[Dd][\.\)]\s*", lines[j]):
-                d_pos = j
-                break
-        end = d_pos + 1 if d_pos is not None else end_limit
-
-        # Find where this question's text starts: after the previous D).
-        start = 0
-        if idx > 0:
-            prev_a = a_positions[idx - 1]
-            prev_d = None
-            for j in range(prev_a + 1, a_pos):
-                if re.match(r"^\s*[Dd][\.\)]\s*", lines[j]):
-                    prev_d = j
-                    break
-            if prev_d is not None:
-                start = prev_d + 1
-            else:
-                start = a_pos - 1 if a_pos > 0 else 0
-
-        block = "\n".join(lines[start:end]).strip()
-        if block:
-            blocks.append(block)
-
-    return blocks
-
+    if a_idx != -1 and b_idx != -1:
+        q_text = " ".join(lines[:a_idx])
+        return {
+            "text": q_text, 
+            "a": re.sub(r'^[aA][\.\)]\s*', '', lines[a_idx]), 
+            "b": re.sub(r'^[bB][\.\)]\s*', '', lines[b_idx]),
+            "c": re.sub(r'^[cC][\.\)]\s*', '', lines[c_idx]) if c_idx != -1 else "C",
+            "d": re.sub(r'^[dD][\.\)]\s*', '', lines[d_idx]) if d_idx != -1 else "D",
+            "correct": "A",
+            "photo_file_id": None
+        }
+    return None
 
 async def parse_and_add_questions(text: str, state: FSMContext) -> int:
-    """
-    Bulk question importer.
-
-    Old behavior:
-      - only searched the next 8 lines for A/B/C/D;
-      - could silently stop after 7 questions;
-      - could merge one question's variants into another.
-
-    New behavior:
-      - detects complete question blocks;
-      - accepts long/multi-line question text;
-      - keeps A/B/C/D attached to the correct question;
-      - enforces the exact block-test section limit.
-    """
     data = await state.get_data()
-    questions_list = list(data.get("questions", []))
-
-    section = data.get("current_block_section") if data.get("is_block") else None
-    if data.get("is_block") and not section:
-        return 0
-
-    if section:
-        existing = sum(1 for q in questions_list if q.get("block_section") == section)
-        limit = BLOCK_COUNTS.get(section, 0)
-    else:
-        existing = len(questions_list)
-        limit = 10**9
-
-    if existing >= limit:
-        return 0
-
+    questions_list = data.get("questions", [])
+    lines = [line.strip() for line in text.split("\n") if line.strip()]
     added = 0
-    blocks = _split_question_blocks(text)
+    i = 0
+    while i < len(lines):
+        a_idx, b_idx, c_idx, d_idx = -1, -1, -1, -1
+        for j in range(i + 1, min(i + 6, len(lines))):
+            l = lines[j].lower()
+            if l.startswith("a)") or l.startswith("a."): a_idx = j
+            elif l.startswith("b)") or l.startswith("b."): b_idx = j
+            elif l.startswith("c)") or l.startswith("c."): c_idx = j
+            elif l.startswith("d)") or l.startswith("d."): d_idx = j
 
-    for block in blocks:
-        if existing + added >= limit:
-            break
-
-        parsed = _parse_question_block(block)
-        if not parsed:
-            continue
-
-        if data.get("is_block"):
-            parsed["block_section"] = section
-
-        questions_list.append(parsed)
-        added += 1
-
+        if a_idx != -1 and b_idx != -1:
+            q_text = " ".join(lines[i:a_idx])
+            questions_list.append({
+                "text": q_text, 
+                "a": re.sub(r'^[aA][\.\)]\s*', '', lines[a_idx]), 
+                "b": re.sub(r'^[bB][\.\)]\s*', '', lines[b_idx]),
+                "c": re.sub(r'^[cC][\.\)]\s*', '', lines[c_idx]) if c_idx != -1 else "C",
+                "d": re.sub(r'^[dD][\.\)]\s*', '', lines[d_idx]) if d_idx != -1 else "D",
+                "correct": "A",
+                "photo_file_id": None
+            })
+            added += 1
+            i = max(a_idx, b_idx, c_idx, d_idx) + 1
+        else: i += 1
     await state.update_data(questions=questions_list)
     return added
-
 
 @router.message(AdminAddTest.waiting_for_answers)
 async def admin_save_answers_and_test(message: Message, state: FSMContext):
     if not await is_admin(message.from_user.id): return
-    tokens = [x.upper() for x in re.findall(r'(?<![A-Z])([A-D])(?![A-Z])', message.text.upper())]
+    tokens = re.findall(r'[A-D]', message.text.upper())
     data = await state.get_data()
     questions_list = data.get("questions", [])
     
-    is_block = data.get("is_block", False)
-    expected = len(questions_list)
-
-    if len(tokens) != expected:
-        await message.answer(
-            f"❌ Javoblar soni noto'g'ri! {expected} ta savol bor, "
-            f"lekin {len(tokens)} ta javob yuborildi.\n\n"
-            "Faqat A, B, C, D harflarini tartib bilan yuboring."
-        )
-        return
-
     for idx, q in enumerate(questions_list):
-        q["correct"] = tokens[idx]
+        if idx < len(tokens): q["correct"] = tokens[idx]
+
+    is_block = data.get("is_block", False)
     
     async with async_session() as session:
         new_test = Test(
             title=data["title"], 
             subject="Blok Test" if is_block else data["subject"], 
-            grade_level="ALL" if is_block else data["grade"],
+            grade_level=data["grade"],
             max_attempts=data["max_attempts"], 
             mode="global_timer",
             duration_minutes=180 if is_block else data.get("duration_minutes", 60),
-            question_time_seconds=None if is_block else data.get("question_time_seconds", 60),
-            questions_count_to_show=90 if is_block else data.get("questions_count_to_show", 30),
+            question_time_seconds=data.get("question_time_seconds", 60),
             is_block_test=is_block,
             block_subjects=json.dumps({"sub1": data.get("block_sub1"), "sub2": data.get("block_sub2")}) if is_block else None,
             start_time=data.get("start_time"),
@@ -2035,17 +1379,21 @@ async def admin_save_answers_and_test(message: Message, state: FSMContext):
             sec_name = None
             points = 1.0
             if is_block:
-                sec_name=q.get("block_section")
-                if sec_name=="Asosiy fan 1":
-                    sec_name=data.get("block_sub1") or "Asosiy fan 1"
-                    points=3.1
-                elif sec_name=="Asosiy fan 2":
-                    sec_name=data.get("block_sub2") or "Asosiy fan 2"
-                    points=2.1
-                elif sec_name in ("Tarix","Ona tili","Matematika"):
-                    points=1.1
+                if idx < 10:
+                    sec_name = "Tarix"
+                    points = 1.1
+                elif idx < 20:
+                    sec_name = "Ona tili"
+                    points = 1.1
+                elif idx < 30:
+                    sec_name = "Matematika"
+                    points = 1.1
+                elif idx < 60:
+                    sec_name = data.get("block_sub1")
+                    points = 3.1
                 else:
-                    raise ValueError("Blok savolida fan bo'limi belgilanmagan.")
+                    sec_name = data.get("block_sub2")
+                    points = 2.1
             
             session.add(Question(
                 test_id=new_test.id, 
@@ -2058,16 +1406,13 @@ async def admin_save_answers_and_test(message: Message, state: FSMContext):
             ))
             
         if data.get("start_time"):
-            student_query = select(Student).where(Student.telegram_id.is_not(None))
-            if not is_block:
-                student_query = student_query.where(Student.grade == data["grade"])
-            students = (await session.execute(student_query)).scalars().all()
+            students = (await session.execute(select(Student).where(Student.grade == data["grade"], Student.telegram_id.is_not(None)))).scalars().all()
             for st in students:
                 session.add(Reminder(test_id=new_test.id, student_id=st.id, reminded=False))
                 
         await session.commit()
     await state.clear()
-    await message.answer("✅ Test muvaffaqiyatli saqlandi! Har bir o'quvchiga savollar tasodifiy va belgilingan miqdorda tarqatiladi.", reply_markup=get_admin_menu())
+    await message.answer("✅ Test muvaffaqiyatli saqlandi va har bir savol uchun vaqt belgilandi!", reply_markup=get_admin_menu())
 
 @router.message(F.text == "⚙️ Testlarni boshqarish")
 async def manage_tests_admin(message: Message):
@@ -2216,36 +1561,19 @@ async def accept_appeal(callback: CallbackQuery, bot: Bot):
         appeal.status = "APPROVED"
         
         ts = await session.get(TestSession, appeal.test_session_id)
-        test_obj = await session.get(Test, ts.test_id)
-        appealed_question = await session.get(Question, appeal.question_id)
-
-        if test_obj and test_obj.is_block_test:
-            appeal_points = {
-                "Tarix": 1.1,
-                "Ona tili": 1.1,
-                "Matematika": 1.1,
-                "Asosiy fan 1": 3.1,
-                "Asosiy fan 2": 2.1,
-            }
-            ts.score += appeal_points.get(
-                appealed_question.section_name if appealed_question else "", 0.0
-            )
-            ts.score_percentage = round((ts.score / 189.0) * 100, 2)
-        else:
-            ts.score += 1.0
-            q_ids = json.loads(ts.selected_question_ids) if ts.selected_question_ids else []
-            questions_count = len(q_ids)
-            if questions_count > 0:
-                ts.score_percentage = round((ts.score / questions_count) * 100, 2)
-
+        ts.score += 1.0
         ts.correct_answers += 1
+        
+        questions_count = await session.scalar(select(func.count(Question.id)).where(Question.test_id == ts.test_id))
+        if questions_count > 0:
+            ts.score_percentage = round((ts.score / questions_count) * 100, 2)
             
         await session.commit()
         
         student = await session.get(Student, appeal.student_id)
         test = await session.get(Test, ts.test_id)
         
-        asyncio.create_task(update_result_in_sheet(student.student_id, test.title, ts.score, ts.score_percentage, ts.correct_answers))
+        update_result_in_sheet(student.student_id, test.title, ts.score, ts.score_percentage, ts.correct_answers)
         
         if student and student.telegram_id:
             try:
@@ -2345,6 +1673,7 @@ async def save_new_admin(message: Message, state: FSMContext):
     try:
         tg_id = int(message.text.strip())
         async with async_session() as session:
+            # Takroran qo'shilishining oldini olish
             existing = (await session.execute(select(Admin).where(Admin.telegram_id == tg_id))).scalar_one_or_none()
             if existing:
                 await message.answer("⚠️ Bu foydalanuvchi allaqachon admin ro'yxatida mavjud!", reply_markup=get_admin_menu())
@@ -2434,55 +1763,41 @@ async def reminder_scheduler(bot: Bot):
             now = datetime.now(timezone.utc)
             reminder_target_time = now + timedelta(minutes=15)
             async with async_session() as session:
-                pass
-        except Exception:
-            pass
+                reminders = (await session.execute(
+                    select(Reminder, Test, Student)
+                    .join(Test, Reminder.test_id == Test.id)
+                    .join(Student, Reminder.student_id == Student.id)
+                    .where(Reminder.reminded == False)
+                )).all()
+                
+                for rem, t, st in reminders:
+                    if t.start_time:
+                        start_t = t.start_time.replace(tzinfo=timezone.utc) if t.start_time.tzinfo is None else t.start_time
+                        if now < start_t <= reminder_target_time:
+                            if st.telegram_id:
+                                try:
+                                    await bot.send_message(
+                                        chat_id=st.telegram_id,
+                                        text=f"🔔 <b>Eslatma!</b>\n\nSiz ro'yxatdan o'tgan <b>{t.subject} ({t.title})</b> testi 15 daqiqadan so'ng boshlanadi."
+                                    )
+                                except: pass
+                            rem.reminded = True
+                await session.commit()
+        except Exception as e:
+            logging.error(f"Reminder error: {e}")
 
 async def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN environment variable topilmadi.")
-
-    logging.basicConfig(
-        level=os.getenv("LOG_LEVEL", "INFO"),
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
-    )
-
+    logging.basicConfig(level=logging.INFO, stream=sys.stdout)
     await init_db()
-
-    # Redis mavjud bo'lsa FSM restartdan keyin ham saqlanadi; bo'lmasa MemoryStorage fallback.
-    storage = MemoryStorage()
-    redis_client = None
-    if RedisStorage is not None and Redis is not None and os.getenv("REDIS_URL"):
-        try:
-            redis_client = Redis.from_url(os.getenv("REDIS_URL"), decode_responses=False)
-            await redis_client.ping()
-            storage = RedisStorage(redis_client)
-            logging.info("Redis FSM storage yoqildi.")
-        except Exception:
-            logging.exception("Redis ulanmagan, MemoryStorage ishlatiladi.")
-            if redis_client:
-                await redis_client.aclose()
-            redis_client = None
-
-    bot = Bot(
-        token=BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-    )
-    dp = Dispatcher(storage=storage)
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-
-    try:
-        logging.info("Olimpiada bot ishga tushdi. TIMER_UPDATE_INTERVAL=%ss", TIMER_UPDATE_INTERVAL)
-        await dp.start_polling(
-            bot,
-            allowed_updates=dp.resolve_used_update_types(),
-            handle_signals=True,
-        )
-    finally:
-        await bot.session.close()
-        if redis_client:
-            await redis_client.aclose()
-        await engine.dispose()
+    await bot.delete_webhook(drop_pending_updates=True)
+    
+    asyncio.create_task(reminder_scheduler(bot))
+    
+    logging.info("🚀 Bot ishga tushdi!")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
