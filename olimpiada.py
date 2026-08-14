@@ -3786,6 +3786,7 @@ async def back_to_menu(message: Message, state: FSMContext, bot: Bot = None):
 
 @router.message(F.text == "❌ Xato javoblar")
 async def wrong_answers_menu(message: Message, state: FSMContext):
+    """Barcha ishlagan testlar — xato va to'g'ri javoblar tahlili."""
     if await state.get_state() == TestProcessState.in_test.state:
         return
     async with async_session() as session:
@@ -3796,51 +3797,96 @@ async def wrong_answers_menu(message: Message, state: FSMContext):
         sessions = (await session.execute(
             select(TestSession, Test)
             .join(Test, TestSession.test_id == Test.id)
-            .where(TestSession.student_id == student.id, TestSession.status == "COMPLETED", Test.is_finished == True)
+            .where(TestSession.student_id == student.id, TestSession.status == "COMPLETED")
             .order_by(TestSession.finished_at.desc())
         )).all()
         if not sessions:
-            await message.answer("⚠️ Hali yakunlangan testlar yo'q yoki tahlil ochilmagan.")
+            await message.answer("⚠️ Siz hali birorta testni yakunlamagansiz.")
             return
-        kb = [[InlineKeyboardButton(
-            text=f"❌ {t.subject} — {ts.score}b ({ts.wrong_answers} xato)",
-            callback_data=f"wrong_ans_{ts.id}"
-        )] for ts, t in sessions[:15]]
-        await message.answer("❌ <b>Xato javoblar tahlili</b>\n\nTestni tanlang:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+        kb = []
+        for ts, t in sessions[:25]:
+            kind = "🧩" if t.is_block_test else "📝"
+            kb.append([InlineKeyboardButton(
+                text=f"{kind} {t.subject} — {ts.score}b (✅{ts.correct_answers}/❌{ts.wrong_answers})",
+                callback_data=f"wrong_ans_{ts.id}_0"
+            )])
+        await message.answer(
+            "📋 <b>Javoblar tahlili</b>\n\nIshlagan testingizni tanlang — xato va to'g'ri javoblarni ko'rasiz:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
+        )
 
 
 @router.callback_query(F.data.startswith("wrong_ans_"))
 async def show_wrong_answers(callback: CallbackQuery):
-    session_id = int(callback.data.split("_")[2])
+    """Tanlangan test bo'yicha barcha savollar: to'g'ri + xato + javobsiz."""
+    parts = callback.data.split("_")
+    # wrong_ans_{session_id}_{page}
+    session_id = int(parts[2])
+    page = int(parts[3]) if len(parts) > 3 else 0
+    PER_PAGE = 8
+
     async with async_session() as session:
         ts = await session.get(TestSession, session_id)
         if not ts:
             await callback.answer("Topilmadi!", show_alert=True)
             return
         test = await session.get(Test, ts.test_id)
-        questions = list((await session.execute(select(Question).where(Question.test_id == test.id).order_by(Question.id))).scalars().all())
-        answers = {a.question_id: a.selected_option for a in (await session.execute(select(Answer).where(Answer.session_id == ts.id))).scalars().all()}
-        text = f"❌ <b>Xato/javobsiz: {test.subject}</b>\nBall: {ts.score} ({ts.score_percentage}%)\n\n"
-        n = 0
-        for idx, q in enumerate(questions, 1):
-            sel = answers.get(q.id)
-            if sel == q.correct_option:
-                continue
-            n += 1
-            status = "⭕ Javob berilmagan" if not sel else f"Siz: <b>{sel}</b>"
-            q_prev = (q.question_text[:100] + "…") if len(q.question_text) > 100 else q.question_text
-            text += f"<b>{idx}.</b> {q_prev}\n{status} | To'g'ri: <b>{q.correct_option}</b>\n\n"
-            if len(text) > 3500:
-                text += "… (qisqartirildi)"
-                break
-        if n == 0:
-            text += "✅ Barcha savollarga to'g'ri javob bergansiz!"
-        try:
-            await callback.message.edit_text(text)
-        except Exception:
-            await callback.message.answer(text)
-        await callback.answer()
+        questions = list((await session.execute(
+            select(Question).where(Question.test_id == test.id).order_by(Question.id)
+        )).scalars().all())
+        answers = {
+            a.question_id: a.selected_option
+            for a in (await session.execute(select(Answer).where(Answer.session_id == ts.id))).scalars().all()
+        }
 
+        total_q = len(questions)
+        total_pages = max(1, (total_q + PER_PAGE - 1) // PER_PAGE)
+        page = max(0, min(page, total_pages - 1))
+        start_i = page * PER_PAGE
+        end_i = min(start_i + PER_PAGE, total_q)
+        page_qs = questions[start_i:end_i]
+
+        kind = "🧩 Blok test" if test.is_block_test else "📝 Oddiy test"
+        out = (
+            f"📋 <b>{test.subject}</b> — {test.title}\n"
+            f"{kind}\n"
+            f"⭐ Ball: <b>{ts.score}</b> ({ts.score_percentage}%)\n"
+            f"✅ To'g'ri: {ts.correct_answers} | ❌ Xato: {ts.wrong_answers} | ⭕ Javobsiz: {ts.unanswered}\n"
+            f"📄 Sahifa {page + 1}/{total_pages} (jami {total_q} savol)\n\n"
+        )
+
+        for idx, q in enumerate(page_qs, start=start_i + 1):
+            sel = answers.get(q.id)
+            if not sel:
+                status, sel_show = "⭕", "—"
+            elif sel == q.correct_option:
+                status, sel_show = "✅", sel
+            else:
+                status, sel_show = "❌", sel
+            sec = f"[{q.section_name}] " if q.section_name else ""
+            q_prev = (q.question_text[:90] + "…") if len(q.question_text) > 90 else q.question_text
+            out += (
+                f"<b>{idx}. {sec}{q_prev}</b>\n"
+                f"Siz: <b>{sel_show}</b> {status} | To'g'ri: <b>{q.correct_option}</b>\n\n"
+            )
+
+        if len(out) > 4000:
+            out = out[:3900] + "\n… (qisqartirildi)"
+
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="⬅️ Oldingi", callback_data=f"wrong_ans_{session_id}_{page - 1}"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton(text="Keyingi ➡️", callback_data=f"wrong_ans_{session_id}_{page + 1}"))
+        kb = []
+        if nav:
+            kb.append(nav)
+
+        try:
+            await callback.message.edit_text(out, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb) if kb else None)
+        except Exception:
+            await callback.message.answer(out, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb) if kb else None)
+        await callback.answer()
 
 @router.callback_query(F.data.startswith("get_result_pdf_"))
 async def download_result_pdf(callback: CallbackQuery, bot: Bot):
