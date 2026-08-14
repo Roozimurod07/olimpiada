@@ -289,17 +289,32 @@ def phone_request_keyboard() -> ReplyKeyboardMarkup:
 
 
 def build_grade_keyboard(prefix: str = "reg") -> InlineKeyboardMarkup:
-    """5-sinf .. 11-sinf + Abituriyent"""
-    grades = [f"{i}-sinf" for i in range(5, 12)] + ["Abituriyent"]
+    """5-sinf .. 11-sinf + Abituriyent (callback qisqa kod bilan)."""
+    items = [(f"{i}-sinf", str(i)) for i in range(5, 12)] + [("Abituriyent", "abitur")]
     rows, row = [], []
-    for g in grades:
-        row.append(InlineKeyboardButton(text=g, callback_data=f"{prefix}_grade_{g}"))
+    for label, code in items:
+        row.append(InlineKeyboardButton(text=label, callback_data=f"{prefix}_grade_{code}"))
         if len(row) == 3:
             rows.append(row)
             row = []
     if row:
         rows.append(row)
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def grade_code_to_label(code: str) -> str:
+    """Callback kodini sinf nomiga aylantirish."""
+    code = (code or "").strip()
+    if code.lower() in ("abitur", "abituriyent"):
+        return "Abituriyent"
+    if code.isdigit() and 5 <= int(code) <= 11:
+        return f"{int(code)}-sinf"
+    # eski format: to'liq nom kelib qolgan bo'lsa
+    if "abitur" in code.lower():
+        return "Abituriyent"
+    if code.endswith("-sinf"):
+        return code
+    return code
 
 
 def build_school_keyboard(prefix: str = "reg", page: int = 0, per_page: int = 20) -> InlineKeyboardMarkup:
@@ -835,22 +850,28 @@ async def reg_pick_grade(callback: CallbackQuery, state: FSMContext):
     if await state.get_state() != SelfRegState.waiting_for_grade.state:
         await callback.answer()
         return
-    grade = callback.data.replace("reg_grade_", "", 1)
+    code = callback.data.replace("reg_grade_", "", 1)
+    grade = grade_code_to_label(code)
     await state.update_data(grade=grade)
-    # Abituriyent — maktab so'ralmaydi, telefon raqami so'raladi
-    if grade == "Abituriyent":
+
+    # Abituriyent -> telefon (maktab so'ralmaydi)
+    if grade == "Abituriyent" or code.lower() in ("abitur", "abituriyent"):
+        await state.update_data(grade="Abituriyent", school="-")
         await state.set_state(SelfRegState.waiting_for_phone)
         try:
-            await callback.message.edit_text(f"✅ Holat: <b>Abituriyent</b>")
+            await callback.message.edit_text("✅ Holat: <b>Abituriyent</b>")
         except Exception:
             pass
         await callback.message.answer(
             "📱 <b>Telefon raqamingizni yuboring.</b>\n\n"
-            "Pastdagi <b>«📱 Telefon raqamni yuborish»</b> tugmasini bosing — raqam avtomatik yuboriladi.",
+            "Pastdagi <b>«📱 Telefon raqamni yuborish»</b> tugmasini bosing — "
+            "raqam avtomatik yuboriladi.",
             reply_markup=phone_request_keyboard()
         )
         await callback.answer()
         return
+
+    # Oddiy sinf -> maktab tanlash
     await state.set_state(SelfRegState.waiting_for_school)
     try:
         await callback.message.edit_text(
@@ -863,7 +884,6 @@ async def reg_pick_grade(callback: CallbackQuery, state: FSMContext):
             reply_markup=build_school_keyboard("reg", 0)
         )
     await callback.answer()
-
 
 
 @router.message(SelfRegState.waiting_for_phone, F.contact)
@@ -1074,8 +1094,40 @@ async def pedit_pick_grade(callback: CallbackQuery, state: FSMContext):
     if await state.get_state() != ProfileEditState.waiting_for_grade.state:
         await callback.answer()
         return
-    grade = callback.data.replace("pedit_grade_", "", 1)
+    code = callback.data.replace("pedit_grade_", "", 1)
+    grade = grade_code_to_label(code)
     await state.update_data(grade=grade)
+    if grade == "Abituriyent" or code.lower() in ("abitur", "abituriyent"):
+        await state.update_data(grade="Abituriyent", school="-")
+        await state.set_state(ProfileEditState.waiting_for_school)
+        # abituriyent profilida maktab o'rniga "-" qo'yib yakunlash uchun school bosqichini o'tkazamiz
+        # telefon so'rash faqat ro'yxatdan o'tishda; profil tahrirda school="-" bilan davom
+        data = await state.get_data()
+        # school tanlashni o'tkazib, to'g'ridan-to'g'ri saqlash uchun virtual school
+        # eng sodda: maktab klaviaturasini ko'rsatmasdan "-" bilan saqlaymiz
+        fullname_parts = data["fullname"].split(" ", 1)
+        first_name = fullname_parts[0]
+        last_name = fullname_parts[1] if len(fullname_parts) > 1 else "-"
+        async with async_session() as session:
+            student = (await session.execute(
+                select(Student).where(Student.telegram_id == callback.from_user.id)
+            )).scalar_one_or_none()
+            if student:
+                student.first_name = first_name
+                student.last_name = last_name
+                student.age = data["age"]
+                student.grade = "Abituriyent"
+                student.school = "-"
+                await session.commit()
+        await state.clear()
+        main_menu = await get_main_menu_keyboard()
+        try:
+            await callback.message.edit_text("✅ Profil yangilandi: <b>Abituriyent</b>")
+        except Exception:
+            pass
+        await callback.message.answer("Asosiy menyu:", reply_markup=main_menu)
+        await callback.answer()
+        return
     await state.set_state(ProfileEditState.waiting_for_school)
     try:
         await callback.message.edit_text(
