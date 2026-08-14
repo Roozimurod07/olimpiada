@@ -278,6 +278,19 @@ def build_age_keyboard(prefix: str = "reg") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def build_grade_reply_keyboard() -> ReplyKeyboardMarkup:
+    """Sinf tanlash — pastki (Reply) tugmalar. Abituriyent ham shu yerda."""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="5-sinf"), KeyboardButton(text="6-sinf"), KeyboardButton(text="7-sinf")],
+            [KeyboardButton(text="8-sinf"), KeyboardButton(text="9-sinf"), KeyboardButton(text="10-sinf")],
+            [KeyboardButton(text="11-sinf"), KeyboardButton(text="Abituriyent")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+
+
 def phone_request_keyboard() -> ReplyKeyboardMarkup:
     """Telegram orqali telefon raqamini yuborish tugmasi (faqat contact)."""
     return ReplyKeyboardMarkup(
@@ -836,11 +849,62 @@ async def reg_pick_age(callback: CallbackQuery, state: FSMContext):
     await state.update_data(age=age)
     await state.set_state(SelfRegState.waiting_for_grade)
     try:
-        await callback.message.edit_text(f"✅ Yosh: <b>{age}</b>\n\n📚 Sinfingizni tanlang:", reply_markup=build_grade_keyboard("reg"))
+        await callback.message.edit_text(f"✅ Yosh: <b>{age}</b>")
     except Exception:
-        await callback.message.answer(f"✅ Yosh: <b>{age}</b>\n\n📚 Sinfingizni tanlang:", reply_markup=build_grade_keyboard("reg"))
+        pass
     await callback.answer()
+    # Reply keyboard — Abituriyent ishonchli ishlashi uchun
+    await callback.message.answer(
+        "📚 <b>Sinfingizni tanlang</b>\n\nPastdagi tugmalardan birini bosing:",
+        reply_markup=build_grade_reply_keyboard()
+    )
 
+
+
+
+@router.message(SelfRegState.waiting_for_grade, F.text)
+async def reg_grade_from_text(message: Message, state: FSMContext, bot: Bot):
+    """Sinf/Abituriyent — pastki tugma orqali (eng ishonchli usul)."""
+    if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
+        await cmd_start(message, state, bot)
+        return
+
+    choice = (message.text or "").strip()
+    data = await state.get_data()
+    if not data.get("fullname") or not data.get("age"):
+        await state.set_state(SelfRegState.waiting_for_fullname)
+        await message.answer("⚠️ Sessiya tugagan. Ism-familiyangizni yuboring:")
+        return
+
+    # ABITURIYENT
+    if choice.lower() == "abituriyent" or choice == "Abituriyent":
+        await state.update_data(grade="Abituriyent", school="-")
+        await state.set_state(SelfRegState.waiting_for_phone)
+        await message.answer(
+            "✅ Siz <b>Abituriyent</b> ni tanladingiz.\n\n"
+            "📱 <b>Telefon raqamini yuboring</b>\n\n"
+            "Pastdagi <b>📱 Telefon raqamni yuborish</b> tugmasini bosing\n"
+            "yoki raqamni yozing: <code>+998901234567</code>",
+            reply_markup=phone_request_keyboard()
+        )
+        return
+
+    # ODIY SINF: 5-sinf .. 11-sinf
+    m = re.match(r"^(\d{1,2})\s*-?\s*sinf$", choice, re.I)
+    if m and 5 <= int(m.group(1)) <= 11:
+        grade = f"{int(m.group(1))}-sinf"
+        await state.update_data(grade=grade)
+        await state.set_state(SelfRegState.waiting_for_school)
+        await message.answer(
+            f"✅ Sinf: <b>{grade}</b>\n\n🏫 Maktabingizni tanlang (1–102):",
+            reply_markup=build_school_keyboard("reg", 0)
+        )
+        return
+
+    await message.answer(
+        "👆 Pastdagi tugmalardan sinfni yoki <b>Abituriyent</b> ni tanlang:",
+        reply_markup=build_grade_reply_keyboard()
+    )
 
 
 @router.callback_query(F.data.startswith("reg_grade_"))
@@ -1033,7 +1097,6 @@ async def reg_pick_school(callback: CallbackQuery, state: FSMContext):
 
 # Eski matn orqali yosh/sinf/maktab kiritishni e'tiborsiz qoldiramiz (faqat Asosiy menyu)
 @router.message(SelfRegState.waiting_for_age)
-@router.message(SelfRegState.waiting_for_grade)
 @router.message(SelfRegState.waiting_for_school)
 async def reg_text_fallback(message: Message, state: FSMContext, bot: Bot):
     if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
@@ -1042,8 +1105,6 @@ async def reg_text_fallback(message: Message, state: FSMContext, bot: Bot):
     st = await state.get_state()
     if st == SelfRegState.waiting_for_age.state:
         await message.answer("👆 Yuqoridagi ro'yxatdan yoshni tanlang:", reply_markup=build_age_keyboard("reg"))
-    elif st == SelfRegState.waiting_for_grade.state:
-        await message.answer("👆 Yuqoridagi ro'yxatdan sinfni tanlang:", reply_markup=build_grade_keyboard("reg"))
     else:
         await message.answer("👆 Yuqoridagi ro'yxatdan maktabni tanlang:", reply_markup=build_school_keyboard("reg", 0))
 
