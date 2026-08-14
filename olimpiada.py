@@ -419,6 +419,13 @@ class AdminPaymentSettings(StatesGroup):
 
 router = Router()
 
+# Istalgan FSM holatida ham ishlashi uchun eng yuqorida
+@router.message(F.text == "🏠 Asosiy menyu")
+async def asosiy_menu_like_start(message: Message, state: FSMContext, bot: Bot):
+    """Asosiy menyu — istalgan holatda aynan /start bilan bir xil."""
+    await cmd_start(message, state, bot)
+
+
 user_next_question_flags = {}
 user_abort_test_flags = {}  # user_id -> True if left to main menu during test
 
@@ -436,13 +443,14 @@ async def get_main_menu_keyboard():
         [KeyboardButton(text="👤 Profilim"), KeyboardButton(text="📊 Mening urinishlarim")],
         [KeyboardButton(text="⚖️ Apellyatsiya"), KeyboardButton(text="🏆 Reyting")],
         [KeyboardButton(text="ℹ️ Olimpiada haqida")],
-        [KeyboardButton(text="🏠 Asosiy menyu")]
+        [KeyboardButton(text="🚀 Start")]
     ])
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
 def get_admin_menu():
     return ReplyKeyboardMarkup(
         keyboard=[
+            [KeyboardButton(text="➕ ID qo'shish")],
             [KeyboardButton(text="📂 Test yuklash"), KeyboardButton(text="🧩 Blok test yuklash")],
             [KeyboardButton(text="⚙️ Blok test holati"), KeyboardButton(text="⚙️ Testlarni boshqarish")],
             [KeyboardButton(text="💰 Pullik rejim"), KeyboardButton(text="💳 To'lov sozlamalari")],
@@ -451,14 +459,14 @@ def get_admin_menu():
             [KeyboardButton(text="📊 Jonli statistika"), KeyboardButton(text="📥 Excel natijalar")],
             [KeyboardButton(text="⚖️ Apellyatsiyalar"), KeyboardButton(text="👥 Adminlar")],
             [KeyboardButton(text="📢 Xabar yuborish"), KeyboardButton(text="🧹 Bazani tozalash")],
-            [KeyboardButton(text="🏠 Asosiy menyu")]
+            [KeyboardButton(text="🚀 Start")]
         ],
         resize_keyboard=True
     )
 
 def get_cancel_to_menu_keyboard():
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="🏠 Asosiy menyu")]],
+        keyboard=[[KeyboardButton(text="🚀 Start")]],
         resize_keyboard=True
     )
 
@@ -466,7 +474,7 @@ def get_finish_test_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="✅ Testni yakunlash va saqlash")],
-            [KeyboardButton(text="🏠 Asosiy menyu")]
+            [KeyboardButton(text="🚀 Start")]
         ],
         resize_keyboard=True
     )
@@ -523,25 +531,37 @@ async def check_sub_callback(callback: CallbackQuery, state: FSMContext, bot: Bo
     await callback.message.answer("🎓 Muvaffaqiyatli obuna bo'ldingiz!\n\nIltimos, to'liq <b>Ism va Familiyangizni</b> kiriting:")
 
 @router.message(SelfRegState.waiting_for_fullname)
-async def process_self_fullname(message: Message, state: FSMContext):
+async def process_self_fullname(message: Message, state: FSMContext, bot: Bot):
+    if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
+        await cmd_start(message, state, bot)
+        return
     await state.update_data(fullname=message.text.strip())
     await state.set_state(SelfRegState.waiting_for_age)
     await message.answer("Rahmat! Endi yoshingizni kiriting (masalan: 16):")
 
 @router.message(SelfRegState.waiting_for_age)
-async def process_self_age(message: Message, state: FSMContext):
+async def process_self_age(message: Message, state: FSMContext, bot: Bot):
+    if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
+        await cmd_start(message, state, bot)
+        return
     await state.update_data(age=message.text.strip())
     await state.set_state(SelfRegState.waiting_for_grade)
     await message.answer("Sinfingizni kiriting (masalan: 11-sinf):")
 
 @router.message(SelfRegState.waiting_for_grade)
-async def process_self_grade(message: Message, state: FSMContext):
+async def process_self_grade(message: Message, state: FSMContext, bot: Bot):
+    if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
+        await cmd_start(message, state, bot)
+        return
     await state.update_data(grade=message.text.strip())
     await state.set_state(SelfRegState.waiting_for_school)
     await message.answer("Maktabingiz raqami yoki nomini kiriting:")
 
 @router.message(SelfRegState.waiting_for_school)
-async def process_self_school(message: Message, state: FSMContext):
+async def process_self_school(message: Message, state: FSMContext, bot: Bot):
+    if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
+        await cmd_start(message, state, bot)
+        return
     data = await state.get_data()
     fullname_parts = data["fullname"].split(" ", 1)
     first_name = fullname_parts[0]
@@ -627,9 +647,9 @@ async def start_profile_edit(callback: CallbackQuery, state: FSMContext):
 
 
 @router.message(ProfileEditState.waiting_for_fullname)
-async def profile_edit_fullname(message: Message, state: FSMContext):
+async def profile_edit_fullname(message: Message, state: FSMContext, bot: Bot):
     if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
-        await back_to_menu(message, state)
+        await cmd_start(message, state, bot)
         return
     await state.update_data(fullname=message.text.strip())
     await state.set_state(ProfileEditState.waiting_for_age)
@@ -637,9 +657,9 @@ async def profile_edit_fullname(message: Message, state: FSMContext):
 
 
 @router.message(ProfileEditState.waiting_for_age)
-async def profile_edit_age(message: Message, state: FSMContext):
+async def profile_edit_age(message: Message, state: FSMContext, bot: Bot):
     if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
-        await back_to_menu(message, state)
+        await cmd_start(message, state, bot)
         return
     await state.update_data(age=message.text.strip())
     await state.set_state(ProfileEditState.waiting_for_grade)
@@ -647,9 +667,9 @@ async def profile_edit_age(message: Message, state: FSMContext):
 
 
 @router.message(ProfileEditState.waiting_for_grade)
-async def profile_edit_grade(message: Message, state: FSMContext):
+async def profile_edit_grade(message: Message, state: FSMContext, bot: Bot):
     if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
-        await back_to_menu(message, state)
+        await cmd_start(message, state, bot)
         return
     await state.update_data(grade=message.text.strip())
     await state.set_state(ProfileEditState.waiting_for_school)
@@ -657,9 +677,9 @@ async def profile_edit_grade(message: Message, state: FSMContext):
 
 
 @router.message(ProfileEditState.waiting_for_school)
-async def profile_edit_school(message: Message, state: FSMContext):
+async def profile_edit_school(message: Message, state: FSMContext, bot: Bot):
     if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
-        await back_to_menu(message, state)
+        await cmd_start(message, state, bot)
         return
     data = await state.get_data()
     fullname_parts = data["fullname"].split(" ", 1)
@@ -856,7 +876,10 @@ async def start_appeal(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 @router.message(AppealState.waiting_for_text)
-async def process_appeal_text(message: Message, state: FSMContext):
+async def process_appeal_text(message: Message, state: FSMContext, bot: Bot):
+    if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
+        await cmd_start(message, state, bot)
+        return
     data = await state.get_data()
     async with async_session() as session:
         student = (await session.execute(select(Student).where(Student.telegram_id == message.from_user.id))).scalar_one_or_none()
@@ -1773,7 +1796,10 @@ async def admin_search_student_prompt(message: Message, state: FSMContext):
     await message.answer("🔍 Qidirilayotgan o'quvchining <b>Ism, Familiyasi</b> yoki <b>ID raqamini</b> yuboring:")
 
 @router.message(AdminSearchStudentState.waiting_for_query)
-async def admin_perform_student_search(message: Message, state: FSMContext):
+async def admin_perform_student_search(message: Message, state: FSMContext, bot: Bot):
+    if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
+        await cmd_start(message, state, bot)
+        return
     if not await is_admin(message.from_user.id): return
     query = message.text.strip()
     await state.clear()
@@ -1958,7 +1984,7 @@ async def pay_for_specific_test(callback: CallbackQuery, state: FSMContext):
 @router.message(PaymentState.waiting_for_receipt, F.photo | F.document)
 async def receive_payment_receipt(message: Message, state: FSMContext, bot: Bot):
     if message.text and message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
-        await back_to_menu(message, state)
+        await cmd_start(message, state, bot)
         return
 
     data = await state.get_data()
@@ -2041,7 +2067,7 @@ async def receive_payment_receipt(message: Message, state: FSMContext, bot: Bot)
 @router.message(PaymentState.waiting_for_receipt)
 async def payment_receipt_invalid(message: Message, state: FSMContext):
     if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
-        await back_to_menu(message, state)
+        await cmd_start(message, state, bot)
         return
     await message.answer("❌ Iltimos, chekni rasm yoki PDF/hujjat sifatida yuboring.")
 
@@ -2096,7 +2122,7 @@ async def admin_payment_settings_prompt(message: Message, state: FSMContext):
 @router.message(AdminPaymentSettings.waiting_for_card)
 async def admin_set_card(message: Message, state: FSMContext):
     if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
-        await back_to_menu(message, state)
+        await cmd_start(message, state, bot)
         return
     txt = message.text.strip()
     if txt != "-":
@@ -2108,7 +2134,7 @@ async def admin_set_card(message: Message, state: FSMContext):
 @router.message(AdminPaymentSettings.waiting_for_price)
 async def admin_set_price(message: Message, state: FSMContext):
     if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
-        await back_to_menu(message, state)
+        await cmd_start(message, state, bot)
         return
     txt = message.text.strip()
     if txt != "-":
@@ -2289,7 +2315,10 @@ async def admin_add_student_prompt(message: Message, state: FSMContext):
     await message.answer("📝 Ma'lumotlarni yuboring:\n<code>Ism, Familiya, Yosh, Sinf, Maktab</code>")
 
 @router.message(AdminAddStudent.waiting_for_data)
-async def admin_save_student(message: Message, state: FSMContext):
+async def admin_save_student(message: Message, state: FSMContext, bot: Bot):
+    if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
+        await cmd_start(message, state, bot)
+        return
     if not await is_admin(message.from_user.id): return
     parts = [p.strip() for p in message.text.split(",")]
     if len(parts) < 5:
@@ -2317,7 +2346,10 @@ async def admin_add_block_test_start(message: Message, state: FSMContext):
     await message.answer("🧩 DTM Blok test sarlavhasini kiriting:")
 
 @router.message(AdminAddTest.waiting_for_title)
-async def admin_get_title(message: Message, state: FSMContext):
+async def admin_get_title(message: Message, state: FSMContext, bot: Bot):
+    if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
+        await cmd_start(message, state, bot)
+        return
     await state.update_data(title=message.text.strip())
     data = await state.get_data()
     if data.get("is_block"):
@@ -2330,13 +2362,19 @@ async def admin_get_title(message: Message, state: FSMContext):
         await message.answer("Fan nomini kiriting:")
 
 @router.message(AdminAddTest.waiting_for_subject)
-async def admin_get_subject(message: Message, state: FSMContext):
+async def admin_get_subject(message: Message, state: FSMContext, bot: Bot):
+    if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
+        await cmd_start(message, state, bot)
+        return
     await state.update_data(subject=message.text.strip())
     await state.set_state(AdminAddTest.waiting_for_grade)
     await message.answer("Sinfni kiriting (masalan: `11-sinf`):")
 
 @router.message(AdminAddTest.waiting_for_grade)
-async def admin_get_grade(message: Message, state: FSMContext):
+async def admin_get_grade(message: Message, state: FSMContext, bot: Bot):
+    if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
+        await cmd_start(message, state, bot)
+        return
     await state.update_data(grade=message.text.strip())
     data = await state.get_data()
     if data.get("is_block"):
@@ -2347,7 +2385,10 @@ async def admin_get_grade(message: Message, state: FSMContext):
         await message.answer("⏱ Har bir savol uchun vaqtni **soniyada** kiriting (masalan: `15` yoki `60`):")
 
 @router.message(AdminAddTest.waiting_for_question_time)
-async def admin_get_question_time(message: Message, state: FSMContext):
+async def admin_get_question_time(message: Message, state: FSMContext, bot: Bot):
+    if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
+        await cmd_start(message, state, bot)
+        return
     try:
         q_time = int(message.text.strip())
         if q_time < 5:
@@ -2361,19 +2402,28 @@ async def admin_get_question_time(message: Message, state: FSMContext):
     await message.answer(f"✅ Har bir savol uchun {q_time} soniya berildi.\n\nMaksimal urinishlar sonini kiriting (masalan: 1):")
 
 @router.message(AdminAddTest.waiting_for_block_sub1)
-async def admin_get_block_sub1(message: Message, state: FSMContext):
+async def admin_get_block_sub1(message: Message, state: FSMContext, bot: Bot):
+    if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
+        await cmd_start(message, state, bot)
+        return
     await state.update_data(block_sub1=message.text.strip())
     await state.set_state(AdminAddTest.waiting_for_block_sub2)
     await message.answer("2-asosiy fanning nomini kiriting (masalan: Ingliz tili yoki Kimyo):")
 
 @router.message(AdminAddTest.waiting_for_block_sub2)
-async def admin_get_block_sub2(message: Message, state: FSMContext):
+async def admin_get_block_sub2(message: Message, state: FSMContext, bot: Bot):
+    if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
+        await cmd_start(message, state, bot)
+        return
     await state.update_data(block_sub2=message.text.strip())
     await state.set_state(AdminAddTest.waiting_for_attempts)
     await message.answer("Maksimal urinishlar sonini kiriting (masalan: 1):")
 
 @router.message(AdminAddTest.waiting_for_attempts)
-async def admin_get_attempts(message: Message, state: FSMContext):
+async def admin_get_attempts(message: Message, state: FSMContext, bot: Bot):
+    if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
+        await cmd_start(message, state, bot)
+        return
     try: att = int(message.text.strip())
     except: att = 1
     await state.update_data(max_attempts=att)
@@ -2381,7 +2431,10 @@ async def admin_get_attempts(message: Message, state: FSMContext):
     await message.answer("Test boshlanish vaqtini kiriting (Format: `YYYY-MM-DD HH:MM` yoki `-`):")
 
 @router.message(AdminAddTest.waiting_for_start_time)
-async def admin_get_start_time(message: Message, state: FSMContext):
+async def admin_get_start_time(message: Message, state: FSMContext, bot: Bot):
+    if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
+        await cmd_start(message, state, bot)
+        return
     txt = message.text.strip()
     start_dt = None
     if txt != "-":
@@ -2485,11 +2538,11 @@ async def admin_ask_for_answers(message: Message, state: FSMContext):
     await message.answer("🔑 To'g'ri javoblarni ketma-ketlikda yuboring (masalan: `A B C D A...`):", reply_markup=get_admin_menu())
 
 @router.message(AdminAddTest.waiting_for_questions, F.text)
-async def admin_add_bulk_questions_text(message: Message, state: FSMContext):
+async def admin_add_bulk_questions_text(message: Message, state: FSMContext, bot: Bot):
     if not await is_admin(message.from_user.id):
         return
     if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
-        await back_to_menu(message, state)
+        await cmd_start(message, state, bot)
         return
     if message.text == "✅ Testni yakunlash va saqlash":
         return
@@ -2575,11 +2628,11 @@ async def parse_and_add_questions(text: str, state: FSMContext) -> int:
     return added
 
 @router.message(AdminAddTest.waiting_for_answers)
-async def admin_save_answers_and_test(message: Message, state: FSMContext):
+async def admin_save_answers_and_test(message: Message, state: FSMContext, bot: Bot):
     if not await is_admin(message.from_user.id):
         return
     if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
-        await back_to_menu(message, state)
+        await cmd_start(message, state, bot)
         return
     tokens = re.findall(r'[A-D]', message.text.upper())
     data = await state.get_data()
@@ -2920,7 +2973,10 @@ async def add_admin_prompt(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 @router.message(AdminManageAdmins.waiting_for_id)
-async def save_new_admin(message: Message, state: FSMContext):
+async def save_new_admin(message: Message, state: FSMContext, bot: Bot):
+    if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
+        await cmd_start(message, state, bot)
+        return
     if message.from_user.id not in SUPER_ADMIN_IDS: return
     try:
         tg_id = int(message.text.strip())
@@ -2985,6 +3041,9 @@ async def broadcast_prompt(message: Message, state: FSMContext):
 
 @router.message(AdminBroadcast.waiting_for_message)
 async def send_broadcast(message: Message, state: FSMContext, bot: Bot):
+    if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
+        await cmd_start(message, state, bot)
+        return
     if not await is_admin(message.from_user.id): return
     async with async_session() as session:
         students = (await session.execute(select(Student).where(Student.telegram_id.is_not(None)))).scalars().all()
@@ -3053,7 +3112,7 @@ async def back_to_menu(message: Message, state: FSMContext, bot: Bot = None):
         main_menu = await get_main_menu_keyboard()
         note = "\n\n⚠️ Test jarayoni to'xtatildi va natija saqlandi." if was_in_test else ""
         await message.answer(
-            f"🏠 <b>Asosiy menyu</b>\n\nXush kelibsiz, <b>{student.first_name} {student.last_name}</b>!\n"
+            f"🚀 <b>Start</b>\n\nXush kelibsiz, <b>{student.first_name} {student.last_name}</b>!\n"
             f"Sinfingiz: <b>{student.grade or 'Nomaʼlum'}</b>{note}",
             reply_markup=main_menu
         )
