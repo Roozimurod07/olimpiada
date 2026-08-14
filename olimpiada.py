@@ -50,6 +50,7 @@ class Student(Base):
     school = Column(String(150), nullable=True)
     grade = Column(String(20), nullable=True)
     telegram_id = Column(Integer, unique=True, nullable=True)
+    phone = Column(String(30), nullable=True)
     is_active = Column(Boolean, default=True)
     # payment_status: none | pending | approved | rejected
     payment_status = Column(String(20), default="none")
@@ -210,6 +211,12 @@ async def init_db():
             ))
         except Exception:
             pass
+        try:
+            await conn.execute(sa_text(
+                "ALTER TABLE students ADD COLUMN phone VARCHAR(30)"
+            ))
+        except Exception:
+            pass
         # grade_level / photo_file_id kengaytirish (ko'p sinf, ko'p rasm)
         for stmt in [
             "ALTER TABLE tests ADD COLUMN grade_level_new TEXT",
@@ -269,6 +276,16 @@ def build_age_keyboard(prefix: str = "reg") -> InlineKeyboardMarkup:
     if row:
         rows.append(row)
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def phone_request_keyboard() -> ReplyKeyboardMarkup:
+    """Telegram orqali telefon raqamini yuborish tugmasi."""
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📱 Telefon raqamni yuborish", request_contact=True)],
+                  [KeyboardButton(text="🏠 Asosiy menyu")]],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
 
 
 def build_grade_keyboard(prefix: str = "reg") -> InlineKeyboardMarkup:
@@ -576,6 +593,7 @@ class SelfRegState(StatesGroup):
     waiting_for_age = State()
     waiting_for_grade = State()
     waiting_for_school = State()
+    waiting_for_phone = State()
 
 class ProfileEditState(StatesGroup):
     waiting_for_fullname = State()
@@ -819,6 +837,20 @@ async def reg_pick_grade(callback: CallbackQuery, state: FSMContext):
         return
     grade = callback.data.replace("reg_grade_", "", 1)
     await state.update_data(grade=grade)
+    # Abituriyent — maktab so'ralmaydi, telefon raqami so'raladi
+    if grade == "Abituriyent":
+        await state.set_state(SelfRegState.waiting_for_phone)
+        try:
+            await callback.message.edit_text(f"✅ Holat: <b>Abituriyent</b>")
+        except Exception:
+            pass
+        await callback.message.answer(
+            "📱 <b>Telefon raqamingizni yuboring.</b>\n\n"
+            "Pastdagi <b>«📱 Telefon raqamni yuborish»</b> tugmasini bosing — raqam avtomatik yuboriladi.",
+            reply_markup=phone_request_keyboard()
+        )
+        await callback.answer()
+        return
     await state.set_state(SelfRegState.waiting_for_school)
     try:
         await callback.message.edit_text(
@@ -831,6 +863,58 @@ async def reg_pick_grade(callback: CallbackQuery, state: FSMContext):
             reply_markup=build_school_keyboard("reg", 0)
         )
     await callback.answer()
+
+
+
+@router.message(SelfRegState.waiting_for_phone, F.contact)
+async def reg_receive_phone_contact(message: Message, state: FSMContext):
+    """Contact tugmasi orqali telefon."""
+    phone = message.contact.phone_number if message.contact else None
+    if not phone:
+        await message.answer("Raqam olinmadi. Qayta urinib ko'ring.", reply_markup=phone_request_keyboard())
+        return
+    if not phone.startswith("+"):
+        phone = "+" + phone
+    data = await state.get_data()
+    fullname_parts = data["fullname"].split(" ", 1)
+    first_name = fullname_parts[0]
+    last_name = fullname_parts[1] if len(fullname_parts) > 1 else "-"
+    unique_id = f"OLM-2026-{''.join(random.choices('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', k=6))}"
+    async with async_session() as session:
+        student = Student(
+            student_id=unique_id,
+            first_name=first_name,
+            last_name=last_name,
+            age=data["age"],
+            grade="Abituriyent",
+            school="-",
+            phone=phone,
+            telegram_id=message.from_user.id
+        )
+        session.add(student)
+        await session.commit()
+    await state.clear()
+    main_menu = await get_main_menu_keyboard()
+    await message.answer(
+        f"✅ Muvaffaqiyatli ro'yxatdan o'tdingiz!\n"
+        f"ID: <code>{unique_id}</code>\n"
+        f"Holat: Abituriyent\n"
+        f"Tel: <code>{phone}</code>",
+        reply_markup=main_menu
+    )
+
+
+@router.message(SelfRegState.waiting_for_phone)
+async def reg_receive_phone_text(message: Message, state: FSMContext, bot: Bot):
+    if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
+        await cmd_start(message, state, bot)
+        return
+    # Faqat contact tugmasi orqali
+    await message.answer(
+        "📱 Iltimos, pastdagi <b>«Telefon raqamni yuborish»</b> tugmasini bosing.\n"
+        "Raqamni qo'lda yozish shart emas.",
+        reply_markup=phone_request_keyboard()
+    )
 
 
 @router.callback_query(F.data.startswith("reg_schpage_"))
@@ -943,7 +1027,8 @@ async def profile_handler(message: Message, state: FSMContext):
             f"Ism: {student.first_name} {student.last_name}\n"
             f"Yosh: {student.age or '-'}\n"
             f"Maktab: {student.school or '-'}\n"
-            f"Sinf: {student.grade or '-'}{pay_info}",
+            f"Sinf: {student.grade or '-'}\n"
+            f"Tel: {student.phone or '-'}{pay_info}",
             reply_markup=markup
         )
 
