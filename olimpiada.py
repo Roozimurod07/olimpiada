@@ -436,14 +436,13 @@ async def get_main_menu_keyboard():
         [KeyboardButton(text="👤 Profilim"), KeyboardButton(text="📊 Mening urinishlarim")],
         [KeyboardButton(text="⚖️ Apellyatsiya"), KeyboardButton(text="🏆 Reyting")],
         [KeyboardButton(text="ℹ️ Olimpiada haqida")],
-        [KeyboardButton(text="🚀 Start")]
+        [KeyboardButton(text="🏠 Asosiy menyu")]
     ])
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
 def get_admin_menu():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="➕ ID qo'shish")],
             [KeyboardButton(text="📂 Test yuklash"), KeyboardButton(text="🧩 Blok test yuklash")],
             [KeyboardButton(text="⚙️ Blok test holati"), KeyboardButton(text="⚙️ Testlarni boshqarish")],
             [KeyboardButton(text="💰 Pullik rejim"), KeyboardButton(text="💳 To'lov sozlamalari")],
@@ -452,14 +451,14 @@ def get_admin_menu():
             [KeyboardButton(text="📊 Jonli statistika"), KeyboardButton(text="📥 Excel natijalar")],
             [KeyboardButton(text="⚖️ Apellyatsiyalar"), KeyboardButton(text="👥 Adminlar")],
             [KeyboardButton(text="📢 Xabar yuborish"), KeyboardButton(text="🧹 Bazani tozalash")],
-            [KeyboardButton(text="🚀 Start")]
+            [KeyboardButton(text="🏠 Asosiy menyu")]
         ],
         resize_keyboard=True
     )
 
 def get_cancel_to_menu_keyboard():
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="🚀 Start")]],
+        keyboard=[[KeyboardButton(text="🏠 Asosiy menyu")]],
         resize_keyboard=True
     )
 
@@ -467,7 +466,7 @@ def get_finish_test_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="✅ Testni yakunlash va saqlash")],
-            [KeyboardButton(text="🚀 Start")]
+            [KeyboardButton(text="🏠 Asosiy menyu")]
         ],
         resize_keyboard=True
     )
@@ -621,7 +620,7 @@ async def start_profile_edit(callback: CallbackQuery, state: FSMContext):
     await state.set_state(ProfileEditState.waiting_for_fullname)
     await callback.message.answer(
         "✏️ <b>Profilni tahrirlash</b>\n\nYangi <b>Ism va Familiyangizni</b> kiriting:\n\n"
-        "(Bekor qilish: 🚀 Start)",
+        "(Bekor qilish: 🏠 Asosiy menyu)",
         reply_markup=get_cancel_to_menu_keyboard()
     )
     await callback.answer()
@@ -1950,7 +1949,7 @@ async def pay_for_specific_test(callback: CallbackQuery, state: FSMContext):
         f"📎 <b>{test.title}</b> uchun to'lov chekini yuboring (rasm yoki PDF).\n\n"
         f"Karta: <code>{card}</code>\n"
         f"Narx: <b>{price}</b> so'm\n\n"
-        f"(Bekor qilish: 🚀 Start)",
+        f"(Bekor qilish: 🏠 Asosiy menyu)",
         reply_markup=get_cancel_to_menu_keyboard()
     )
     await callback.answer()
@@ -3054,7 +3053,7 @@ async def back_to_menu(message: Message, state: FSMContext, bot: Bot = None):
         main_menu = await get_main_menu_keyboard()
         note = "\n\n⚠️ Test jarayoni to'xtatildi va natija saqlandi." if was_in_test else ""
         await message.answer(
-            f"🚀 <b>Start</b>\n\nXush kelibsiz, <b>{student.first_name} {student.last_name}</b>!\n"
+            f"🏠 <b>Asosiy menyu</b>\n\nXush kelibsiz, <b>{student.first_name} {student.last_name}</b>!\n"
             f"Sinfingiz: <b>{student.grade or 'Nomaʼlum'}</b>{note}",
             reply_markup=main_menu
         )
