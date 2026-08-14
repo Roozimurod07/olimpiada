@@ -2254,11 +2254,14 @@ async def admin_student_details(callback: CallbackQuery):
             .where(TestSession.student_id == student.id, TestSession.status == "COMPLETED")
         )).all()
         
+        status_st = "🟢 Faol" if student.is_active else "🚫 Bloklangan"
         text = f"👤 <b>O'quvchi ma'lumotlari:</b>\n\n" \
                f"F.I.Sh: <b>{student.first_name} {student.last_name}</b>\n" \
                f"ID: <code>{student.student_id}</code>\n" \
-               f"Sinf: {student.grade or '-'}\nMaktab: {student.school or '-'}\n\n" \
-               f"📊 <b>Ishlagan testlari:</b>"
+               f"Sinf: {student.grade or '-'} | Yosh: {student.age or '-'}\n" \
+               f"Maktab: {student.school or '-'}\n" \
+               f"Holat: {status_st}\n\n" \
+               f"📊 <b>Ishlagan testlari</b> (bosib tahlilni oching):"
                
         if not sessions:
             text += "\nHali test ishlamagan."
@@ -2270,7 +2273,11 @@ async def admin_student_details(callback: CallbackQuery):
             
         keyboard = []
         for ts, t in sessions:
-            keyboard.append([InlineKeyboardButton(text=f"📚 {t.subject} ({ts.score} ball - {ts.score_percentage}%)", callback_data=f"adm_sess_analysis_{ts.id}")])
+            kind = "🧩" if t.is_block_test else "📝"
+            keyboard.append([InlineKeyboardButton(
+                text=f"{kind} {t.subject} | {ts.score}b ({ts.score_percentage}%)",
+                callback_data=f"adm_sess_analysis_{ts.id}"
+            )])
         if student.is_active:
             keyboard.append([InlineKeyboardButton(text="🚫 Bloklash", callback_data=f"adm_block_{student.id}")])
         else:
@@ -2280,31 +2287,79 @@ async def admin_student_details(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("adm_sess_analysis_"))
 async def admin_session_question_analysis(callback: CallbackQuery):
-    session_id = int(callback.data.replace("adm_sess_analysis_", ""))
+    """Admin: o'quvchi javoblari tahlili (oddiy + blok), sahifalash bilan."""
+    parts = callback.data.replace("adm_sess_analysis_", "").split("_")
+    session_id = int(parts[0])
+    page = int(parts[1]) if len(parts) > 1 else 0
+    PER_PAGE = 8
+
     async with async_session() as session:
         ts = await session.get(TestSession, session_id)
+        if not ts:
+            await callback.answer("Sessiya topilmadi!", show_alert=True)
+            return
         test = await session.get(Test, ts.test_id)
         student = await session.get(Student, ts.student_id)
-        
-        questions = (await session.execute(select(Question).where(Question.test_id == test.id))).scalars().all()
-        answers = {a.question_id: a.selected_option for a in (await session.execute(select(Answer).where(Answer.session_id == ts.id))).scalars().all()}
-        
-        text = f"📋 <b>{student.first_name} {student.last_name} ning test natijasi</b>\n" \
-               f"📚 {test.subject} ({test.title})\n" \
-               f"⭐ Ball: {ts.score} ({ts.score_percentage}%)\n" \
-               f"✅ To'g'ri: {ts.correct_answers} | ❌ Noto'g'ri: {ts.wrong_answers} | ⭕ Javobsiz: {ts.unanswered}\n\n"
-               
-        for idx, q in enumerate(questions, 1):
-            sel = answers.get(q.id, "Javob berilmagan")
-            status = "✅" if sel == q.correct_option else "❌"
+
+        questions = list((await session.execute(
+            select(Question).where(Question.test_id == test.id).order_by(Question.id)
+        )).scalars().all())
+        answers = {
+            a.question_id: a.selected_option
+            for a in (await session.execute(select(Answer).where(Answer.session_id == ts.id))).scalars().all()
+        }
+
+        total_q = len(questions)
+        total_pages = max(1, (total_q + PER_PAGE - 1) // PER_PAGE)
+        page = max(0, min(page, total_pages - 1))
+        start_i = page * PER_PAGE
+        end_i = min(start_i + PER_PAGE, total_q)
+        page_qs = questions[start_i:end_i]
+
+        kind = "🧩 Blok test" if test.is_block_test else "📝 Oddiy test"
+        out = (
+            f"📋 <b>{student.first_name} {student.last_name}</b>\n"
+            f"ID: <code>{student.student_id}</code> | {student.grade or '-'}\n"
+            f"{kind}: <b>{test.subject}</b> — {test.title}\n"
+            f"⭐ Ball: <b>{ts.score}</b> ({ts.score_percentage}%)\n"
+            f"✅ {ts.correct_answers} | ❌ {ts.wrong_answers} | ⭕ {ts.unanswered}\n"
+            f"📄 Sahifa {page + 1}/{total_pages} (jami {total_q} savol)\n\n"
+        )
+
+        for idx, q in enumerate(page_qs, start=start_i + 1):
+            sel = answers.get(q.id)
+            if not sel:
+                status, sel_show = "⭕", "—"
+            elif sel == q.correct_option:
+                status, sel_show = "✅", sel
+            else:
+                status, sel_show = "❌", sel
             sec = f"[{q.section_name}] " if q.section_name else ""
-            text += f"<b>{idx}. {sec}{q.question_text}</b>\nUning javobi: <b>{sel}</b> {status} | To'g'ri javob: <b>{q.correct_option}</b>\n\n"
-            
-        if len(text) > 4000:
-            text = text[:3900] + "\n... (matn qisqartirildi)"
-            
-        await callback.message.edit_text(text)
+            q_prev = (q.question_text[:90] + "…") if len(q.question_text) > 90 else q.question_text
+            out += (
+                f"<b>{idx}. {sec}{q_prev}</b>\n"
+                f"Belgilandi: <b>{sel_show}</b> {status} | To'g'ri: <b>{q.correct_option}</b>\n\n"
+            )
+
+        if len(out) > 4000:
+            out = out[:3900] + "\n… (qisqartirildi)"
+
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="⬅️ Oldingi", callback_data=f"adm_sess_analysis_{session_id}_{page - 1}"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton(text="Keyingi ➡️", callback_data=f"adm_sess_analysis_{session_id}_{page + 1}"))
+        kb = []
+        if nav:
+            kb.append(nav)
+        kb.append([InlineKeyboardButton(text="👤 O'quvchiga qaytish", callback_data=f"adm_st_detail_{student.id}")])
+
+        try:
+            await callback.message.edit_text(out, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+        except Exception:
+            await callback.message.answer(out, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
         await callback.answer()
+
 
 @router.message(F.text == "ℹ️ Olimpiada haqida")
 async def about_handler(message: Message, state: FSMContext):
