@@ -216,6 +216,14 @@ async def init_db():
             "paid_mode": "0",
             "payment_card": "8600 XXXX XXXX XXXX",
             "payment_price": "50000",
+            "required_channels": REQUIRED_CHANNEL,
+            "test_rules": (
+                "1. Test vaqtida boshqa ilovalardan foydalanmang.\n"
+                "2. Har bir savol uchun berilgan vaqt ichida javob bering.\n"
+                "3. Javobni tanlagach, keyingi savolga o'tiladi.\n"
+                "4. Testni erta tugatsangiz, natija saqlanadi.\n"
+                "5. Apellyatsiya faqat test yakunlangandan keyin ochiladi."
+            ),
         }
         for key, val in defaults.items():
             setting = await session.get(Setting, key)
@@ -284,14 +292,41 @@ async def student_payment_status_for_test(student_id: int, test_id: int) -> str:
             return "none"
         return (payment.status or "PENDING").lower()
 
+async def get_required_channels() -> list:
+    """Obuna talab qilinadigan kanallar ro'yxati (vergul bilan sozlanadi)."""
+    raw = await get_setting("required_channels", REQUIRED_CHANNEL)
+    channels = []
+    for part in re.split(r"[,\n;]+", raw):
+        ch = part.strip()
+        if not ch:
+            continue
+        if not ch.startswith("@"):
+            ch = "@" + ch.lstrip("@")
+        channels.append(ch)
+    return channels or [REQUIRED_CHANNEL]
+
+
 async def check_subscription(user_id: int, bot: Bot) -> bool:
-    try:
-        member = await bot.get_chat_member(chat_id=REQUIRED_CHANNEL, user_id=user_id)
-        if member.status in ["member", "administrator", "creator"]:
-            return True
-    except Exception:
-        pass
-    return False
+    """Barcha majburiy kanallarga obuna bo'lganligini tekshiradi."""
+    channels = await get_required_channels()
+    for ch in channels:
+        try:
+            member = await bot.get_chat_member(chat_id=ch, user_id=user_id)
+            if member.status not in ["member", "administrator", "creator"]:
+                return False
+        except Exception:
+            return False
+    return True
+
+
+async def subscription_keyboard():
+    channels = await get_required_channels()
+    rows = []
+    for ch in channels:
+        uname = ch.replace("@", "")
+        rows.append([InlineKeyboardButton(text=f"📢 {ch}", url=f"https://t.me/{uname}")])
+    rows.append([InlineKeyboardButton(text="✅ Obunani tekshirish", callback_data="check_sub")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def get_gspread_sheet():
     scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
@@ -366,6 +401,40 @@ def generate_certificate_pdf(student_name, test_title, subject, score_pct):
     pdf_buffer.seek(0)
     return pdf_buffer.read()
 
+
+def generate_result_pdf(student_name, test_title, subject, score, pct, correct, wrong, unanswered):
+    """O'quvchi uchun shaxsiy natija PDF."""
+    pdf_buffer = io.BytesIO()
+    c = canvas.Canvas(pdf_buffer, pagesize=landscape(letter))
+    width, height = 792, 612
+    c.setStrokeColor(colors.HexColor("#1A365D"))
+    c.setLineWidth(4)
+    c.rect(20, 20, width - 40, height - 40)
+    c.setFillColor(colors.HexColor("#1A365D"))
+    c.setFont("Helvetica-Bold", 24)
+    c.drawCentredString(width / 2, height - 80, "TEST NATIJASI")
+    c.setFont("Helvetica-Bold", 18)
+    c.setFillColor(colors.HexColor("#2B6CB0"))
+    c.drawCentredString(width / 2, height - 130, student_name)
+    c.setFillColor(colors.HexColor("#4A5568"))
+    c.setFont("Helvetica", 14)
+    y = height - 180
+    for line in [
+        f"Fan: {subject}",
+        f"Test: {test_title}",
+        f"Ball: {score} ({pct}%)",
+        f"To'g'ri: {correct} | Noto'g'ri: {wrong} | Javobsiz: {unanswered}",
+        f"Sana: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC",
+    ]:
+        c.drawCentredString(width / 2, y, line)
+        y -= 28
+    c.setFont("Helvetica-Oblique", 11)
+    c.drawCentredString(width / 2, 50, "Professional Olimpiada tizimi")
+    c.save()
+    pdf_buffer.seek(0)
+    return pdf_buffer.read()
+
+
 class SelfRegState(StatesGroup):
     waiting_for_fullname = State()
     waiting_for_age = State()
@@ -417,6 +486,17 @@ class AdminPaymentSettings(StatesGroup):
     waiting_for_card = State()
     waiting_for_price = State()
 
+class AdminChannelsState(StatesGroup):
+    waiting_for_channels = State()
+
+class AdminRulesState(StatesGroup):
+    waiting_for_rules = State()
+
+class AdminEditQuestionState(StatesGroup):
+    waiting_for_test = State()
+    waiting_for_q_index = State()
+    waiting_for_new_text = State()
+
 router = Router()
 
 # Istalgan FSM holatida ham ishlashi uchun eng yuqorida
@@ -442,6 +522,7 @@ async def get_main_menu_keyboard():
     keyboard.extend([
         [KeyboardButton(text="👤 Profilim"), KeyboardButton(text="📊 Mening urinishlarim")],
         [KeyboardButton(text="⚖️ Apellyatsiya"), KeyboardButton(text="🏆 Reyting")],
+        [KeyboardButton(text="❌ Xato javoblar"), KeyboardButton(text="🏫 Maktab reytingi")],
         [KeyboardButton(text="ℹ️ Olimpiada haqida")],
         [KeyboardButton(text="🏠 Asosiy menyu")]
     ])
@@ -454,10 +535,12 @@ def get_admin_menu():
             [KeyboardButton(text="⚙️ Blok test holati"), KeyboardButton(text="⚙️ Testlarni boshqarish")],
             [KeyboardButton(text="💰 Pullik rejim"), KeyboardButton(text="💳 To'lov sozlamalari")],
             [KeyboardButton(text="📋 To'lov so'rovlari")],
-            [KeyboardButton(text="🏆 Admin reyting"), KeyboardButton(text="🔍 O'quvchini qidirish")],
+            [KeyboardButton(text="🏆 Admin reyting"), KeyboardButton(text="🏫 Maktab reytingi")],
+            [KeyboardButton(text="🔍 O'quvchini qidirish")],
             [KeyboardButton(text="📊 Jonli statistika"), KeyboardButton(text="📥 Excel natijalar")],
             [KeyboardButton(text="⚖️ Apellyatsiyalar"), KeyboardButton(text="👥 Adminlar")],
-            [KeyboardButton(text="📢 Xabar yuborish"), KeyboardButton(text="🧹 Bazani tozalash")],
+            [KeyboardButton(text="📢 Xabar yuborish"), KeyboardButton(text="📢 Kanallar")],
+            [KeyboardButton(text="📜 Test qoidalari"), KeyboardButton(text="🧹 Bazani tozalash")],
             [KeyboardButton(text="🏠 Asosiy menyu")]
         ],
         resize_keyboard=True
@@ -487,11 +570,13 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot):
 
     is_subscribed = await check_subscription(message.from_user.id, bot)
     if not is_subscribed:
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📢 Kanalga obuna bo'lish", url=f"https://t.me/{REQUIRED_CHANNEL.replace('@', '')}")],
-            [InlineKeyboardButton(text="✅ Obunani tekshirish", callback_data="check_sub")]
-        ])
-        await message.answer(f"⚠️ Botdan foydalanish uchun avval quyidagi kanalga obuna bo'lishingiz kerak:\n\n{REQUIRED_CHANNEL}", reply_markup=keyboard)
+        channels = await get_required_channels()
+        ch_list = "\n".join(channels)
+        keyboard = await subscription_keyboard()
+        await message.answer(
+            f"⚠️ Botdan foydalanish uchun avval quyidagi kanal(lar)ga obuna bo'lishingiz kerak:\n\n{ch_list}",
+            reply_markup=keyboard
+        )
         return
 
     async with async_session() as session:
@@ -829,7 +914,7 @@ async def show_test_analysis_for_appeal(callback: CallbackQuery):
         if nav:
             keyboard.append(nav)
 
-        keyboard.append([InlineKeyboardButton(text="🎓 Sertifikatni yuklab olish", callback_data=f"get_cert_{ts.id}")])
+        keyboard.append([InlineKeyboardButton(text="🎓 Sertifikat", callback_data=f"get_cert_{ts.id}"), InlineKeyboardButton(text="📄 Natija PDF", callback_data=f"get_result_pdf_{ts.id}")])
 
         if len(text) > 4000:
             text = text[:3900] + "\n... (matn qisqartirildi)"
@@ -919,7 +1004,7 @@ async def start_test_prompt(message: Message, state: FSMContext):
             await message.answer(f"⚠️ Hozirda <b>{student.grade}</b> uchun faol oddiy testlar mavjud emas.")
             return
 
-        keyboard_buttons = [[InlineKeyboardButton(text=f"📚 {t.subject} — {t.title}", callback_data=f"start_test_{t.id}")] for t in tests]
+        keyboard_buttons = [[InlineKeyboardButton(text=f"📚 {t.subject} — {t.title}", callback_data=f"ask_rules_test_{t.id}")] for t in tests]
         await message.answer("📝 <b>Mavjud testlar:</b>\n\nTestni tanlang:", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_buttons))
 
 @router.message(F.text == "🗂 Blok testlar")
@@ -963,7 +1048,7 @@ async def start_block_test_prompt(message: Message, state: FSMContext):
                     mark = " 🔒"
             keyboard_buttons.append([InlineKeyboardButton(
                 text=f"🧩 {t.subject} — {t.title}{mark}",
-                callback_data=f"start_block_{t.id}"
+                callback_data=f"ask_rules_block_{t.id}"
             )])
         note = ""
         if paid_mode:
@@ -1415,7 +1500,48 @@ async def finish_block_test_by_student(callback: CallbackQuery, state: FSMContex
             
     await state.clear()
     main_menu = await get_main_menu_keyboard()
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📄 Natijani PDF yuklab olish", callback_data=f"get_result_pdf_{ts.id}")]
+    ])
     await callback.message.answer(f"🏆 <b>BLOK TEST YAKUNLANDI!</b>\n\nSiz to'plagan ball: <b>{ts.score}</b> ({ts.score_percentage}%).", reply_markup=main_menu)
+    await callback.message.answer("Natijangizni fayl sifatida yuklab olishingiz mumkin:", reply_markup=kb)
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("ask_rules_test_"))
+async def ask_rules_before_test(callback: CallbackQuery):
+    test_id = int(callback.data.split("_")[3])
+    rules = await get_setting("test_rules", "Test qoidalariga rioya qiling.")
+    async with async_session() as session:
+        test = await session.get(Test, test_id)
+        title = test.title if test else str(test_id)
+        subject = test.subject if test else ""
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Roziman, boshlash", callback_data=f"start_test_{test_id}")],
+        [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="none")]
+    ])
+    await callback.message.edit_text(
+        f"📜 <b>Test qoidalari</b>\n\n📚 {subject} — {title}\n\n{rules}\n\nDavom etish uchun roziligingizni bildiring.",
+        reply_markup=kb
+    )
+    await callback.answer()
+
+
+
+@router.callback_query(F.data.startswith("ask_rules_block_"))
+async def ask_rules_before_block(callback: CallbackQuery):
+    test_id = int(callback.data.split("_")[3])
+    rules = await get_setting("test_rules", "Test qoidalariga rioya qiling.")
+    async with async_session() as session:
+        test = await session.get(Test, test_id)
+        title = test.title if test else str(test_id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Roziman, boshlash", callback_data=f"start_block_{test_id}")],
+        [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="none")]
+    ])
+    await callback.message.edit_text(
+        f"📜 <b>Blok test qoidalari</b>\n\n🧩 {title}\n⏱ Umumiy vaqt: 180 daqiqa\n\n{rules}\n\nDavom etish uchun roziligingizni bildiring.",
+        reply_markup=kb
+    )
     await callback.answer()
 
 @router.callback_query(F.data.startswith("start_test_"))
@@ -1603,11 +1729,15 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
 
                 await state.clear()
                 main_menu = await get_main_menu_keyboard()
+                kb = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="📄 Natijani PDF yuklab olish", callback_data=f"get_result_pdf_{sess.id}")]
+                ])
                 await bot.send_message(
                     chat_id=user_id,
                     text=f"🏆 <b>TEST YAKUNLANDI!</b>\n\nNatijangiz: {sess.score} ball ({sess.score_percentage}%).",
                     reply_markup=main_menu
                 )
+                await bot.send_message(chat_id=user_id, text="Natijangizni fayl sifatida yuklab olishingiz mumkin:", reply_markup=kb)
 
 @router.callback_query(F.data.startswith("ans_"))
 async def save_answer(callback: CallbackQuery, bot: Bot):
@@ -1842,13 +1972,22 @@ async def admin_student_details(callback: CallbackQuery):
                
         if not sessions:
             text += "\nHali test ishlamagan."
-            await callback.message.edit_text(text)
+            kb = []
+            if student.is_active:
+                kb.append([InlineKeyboardButton(text="🚫 Bloklash", callback_data=f"adm_block_{student.id}")])
+            else:
+                kb.append([InlineKeyboardButton(text="✅ Blokdan chiqarish", callback_data=f"adm_unblock_{student.id}")])
+            await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb) if kb else None)
             await callback.answer()
             return
             
         keyboard = []
         for ts, t in sessions:
             keyboard.append([InlineKeyboardButton(text=f"📚 {t.subject} ({ts.score} ball - {ts.score_percentage}%)", callback_data=f"adm_sess_analysis_{ts.id}")])
+        if student.is_active:
+            keyboard.append([InlineKeyboardButton(text="🚫 Bloklash", callback_data=f"adm_block_{student.id}")])
+        else:
+            keyboard.append([InlineKeyboardButton(text="✅ Blokdan chiqarish", callback_data=f"adm_unblock_{student.id}")])
             
         await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
         await callback.answer()
@@ -2710,8 +2849,43 @@ async def admin_save_answers_and_test(message: Message, state: FSMContext):
                 session.add(Reminder(test_id=new_test.id, student_id=st.id, reminded=False))
                 
         await session.commit()
+        new_test_id = new_test.id
+        grade_level = data["grade"]
+        is_block_flag = is_block
+        subj = "Blok Test" if is_block else data.get("subject", "")
+        title = data["title"]
     await state.clear()
-    await message.answer("✅ Blok test muvaffaqiyatli saqlandi! Ballar va fanlar talabga moslab taqsimlandi.", reply_markup=get_admin_menu())
+    await message.answer("✅ Test muvaffaqiyatli saqlandi!", reply_markup=get_admin_menu())
+    # Bildirishnoma: o'quvchilarga
+    try:
+        async with async_session() as session:
+            if is_block_flag:
+                students = (await session.execute(
+                    select(Student).where(Student.telegram_id.is_not(None), Student.is_active == True)
+                )).scalars().all()
+            else:
+                students = (await session.execute(
+                    select(Student).where(
+                        Student.grade == grade_level,
+                        Student.telegram_id.is_not(None),
+                        Student.is_active == True
+                    )
+                )).scalars().all()
+        bot = message.bot
+        n = 0
+        for st in students[:500]:
+            try:
+                await bot.send_message(
+                    st.telegram_id,
+                    f"📢 <b>Yangi test ochildi!</b>\n\n📚 {subj} — {title}\nSinf: {grade_level}\n\nMenyudan testni tanlab boshlashingiz mumkin."
+                )
+                n += 1
+                await asyncio.sleep(0.03)
+            except Exception:
+                pass
+        await message.answer(f"📣 {n} ta o'quvchiga bildirishnoma yuborildi.")
+    except Exception as e:
+        print(f"Notify error: {e}")
 
 @router.message(F.text == "⚙️ Testlarni boshqarish")
 async def manage_tests_admin(message: Message):
@@ -2728,9 +2902,13 @@ async def manage_tests_admin(message: Message):
                 InlineKeyboardButton(text=f"[{t.grade_level}] {t.subject} ({status_emoji})", callback_data="none"),
             ])
             keyboard.append([
-                InlineKeyboardButton(text="🔄 Holatni o'zgartirish", callback_data=f"toggle_test_{t.id}"),
-                InlineKeyboardButton(text="🏁 Testni yakunlash", callback_data=f"finish_test_{t.id}"),
-                InlineKeyboardButton(text="🗑 O'chirish", callback_data=f"delete_test_{t.id}")
+                InlineKeyboardButton(text="🔄 Holat", callback_data=f"toggle_test_{t.id}"),
+                InlineKeyboardButton(text="🏁 Yakun", callback_data=f"finish_test_{t.id}"),
+                InlineKeyboardButton(text="🗑", callback_data=f"delete_test_{t.id}")
+            ])
+            keyboard.append([
+                InlineKeyboardButton(text="📋 Nusxa", callback_data=f"clone_test_{t.id}"),
+                InlineKeyboardButton(text="✏️ Savollar", callback_data=f"edit_qs_{t.id}")
             ])
         await message.answer("⚙️ Testlarni boshqarish:", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
 
@@ -2999,7 +3177,17 @@ async def live_statistics(message: Message):
     async with async_session() as session:
         total = await session.scalar(select(func.count(Student.id)))
         completed = await session.scalar(select(func.count(TestSession.id)).where(TestSession.status == "COMPLETED"))
-        await message.answer(f"📊 <b>Statistika:</b>\n\nJami o'quvchilar: {total}\nTest topshirganlar: {completed or 0}")
+        in_progress = await session.scalar(select(func.count(TestSession.id)).where(TestSession.status == "IN_PROGRESS"))
+        blocked = await session.scalar(select(func.count(Student.id)).where(Student.is_active == False))
+        pending_pay = await session.scalar(select(func.count(Payment.id)).where(Payment.status == "PENDING"))
+        await message.answer(
+            f"📊 <b>Jonli statistika:</b>\n\n"
+            f"👥 Jami o'quvchilar: {total}\n"
+            f"🚫 Bloklangan: {blocked or 0}\n"
+            f"✅ Test topshirganlar: {completed or 0}\n"
+            f"⏳ Hozir ishlayotgan: {in_progress or 0}\n"
+            f"💳 Kutilayotgan to'lov: {pending_pay or 0}"
+        )
 
 @router.message(F.text == "📥 Excel natijalar")
 async def export_excel_results(message: Message, bot: Bot):
@@ -3090,12 +3278,11 @@ async def back_to_menu(message: Message, state: FSMContext, bot: Bot = None):
     if bot is not None:
         is_subscribed = await check_subscription(message.from_user.id, bot)
         if not is_subscribed:
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📢 Kanalga obuna bo'lish", url=f"https://t.me/{REQUIRED_CHANNEL.replace('@', '')}")],
-                [InlineKeyboardButton(text="✅ Obunani tekshirish", callback_data="check_sub")]
-            ])
+            channels = await get_required_channels()
+            ch_list = "\n".join(channels)
+            keyboard = await subscription_keyboard()
             await message.answer(
-                f"⚠️ Botdan foydalanish uchun avval quyidagi kanalga obuna bo'lishingiz kerak:\n\n{REQUIRED_CHANNEL}",
+                f"⚠️ Botdan foydalanish uchun avval quyidagi kanal(lar)ga obuna bo'lishingiz kerak:\n\n{ch_list}",
                 reply_markup=keyboard
             )
             return
@@ -3118,6 +3305,410 @@ async def back_to_menu(message: Message, state: FSMContext, bot: Bot = None):
     else:
         await state.set_state(SelfRegState.waiting_for_fullname)
         await message.answer("🎓 <b>Olimpiada tizimiga xush kelibsiz!</b>\n\nIltimos, to'liq <b>Ism va Familiyangizni</b> kiriting:")
+
+
+# ==================== YANGI FUNKSIYALAR ====================
+
+@router.message(F.text == "❌ Xato javoblar")
+async def wrong_answers_menu(message: Message, state: FSMContext):
+    """Faqat noto'g'ri va javobsiz savollar tahlili."""
+    if await state.get_state() == TestProcessState.in_test.state:
+        return
+    async with async_session() as session:
+        student = (await session.execute(select(Student).where(Student.telegram_id == message.from_user.id))).scalar_one_or_none()
+        if not student:
+            await message.answer("Ro'yxatdan o'tmagansiz.")
+            return
+        sessions = (await session.execute(
+            select(TestSession, Test)
+            .join(Test, TestSession.test_id == Test.id)
+            .where(TestSession.student_id == student.id, TestSession.status == "COMPLETED", Test.is_finished == True)
+            .order_by(TestSession.finished_at.desc())
+        )).all()
+        if not sessions:
+            await message.answer("⚠️ Hali yakunlangan testlar yo'q yoki tahlil ochilmagan.")
+            return
+        kb = [[InlineKeyboardButton(
+            text=f"❌ {t.subject} — {ts.score}b ({ts.wrong_answers} xato)",
+            callback_data=f"wrong_ans_{ts.id}"
+        )] for ts, t in sessions[:15]]
+        await message.answer("❌ <b>Xato javoblar tahlili</b>\n\nTestni tanlang:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+
+@router.callback_query(F.data.startswith("wrong_ans_"))
+async def show_wrong_answers(callback: CallbackQuery):
+    session_id = int(callback.data.split("_")[2])
+    async with async_session() as session:
+        ts = await session.get(TestSession, session_id)
+        if not ts:
+            await callback.answer("Topilmadi!", show_alert=True)
+            return
+        test = await session.get(Test, ts.test_id)
+        questions = list((await session.execute(
+            select(Question).where(Question.test_id == test.id).order_by(Question.id)
+        )).scalars().all())
+        answers = {
+            a.question_id: a.selected_option
+            for a in (await session.execute(select(Answer).where(Answer.session_id == ts.id))).scalars().all()
+        }
+        text = f"❌ <b>Xato/javobsiz: {test.subject}</b>\nBall: {ts.score} ({ts.score_percentage}%)\n\n"
+        n = 0
+        for idx, q in enumerate(questions, 1):
+            sel = answers.get(q.id)
+            if sel == q.correct_option:
+                continue
+            n += 1
+            status = "⭕ Javob berilmagan" if not sel else f"Siz: <b>{sel}</b>"
+            q_prev = (q.question_text[:100] + "…") if len(q.question_text) > 100 else q.question_text
+            text += f"<b>{idx}.</b> {q_prev}\n{status} | To'g'ri: <b>{q.correct_option}</b>\n\n"
+            if len(text) > 3500:
+                text += "… (davomi qisqartirildi)"
+                break
+        if n == 0:
+            text += "✅ Barcha savollarga to'g'ri javob bergansiz!"
+        try:
+            await callback.message.edit_text(text)
+        except Exception:
+            await callback.message.answer(text)
+        await callback.answer()
+
+
+@router.callback_query(F.data.startswith("get_result_pdf_"))
+async def download_result_pdf(callback: CallbackQuery, bot: Bot):
+    """Shaxsiy natija PDF yuklab olish."""
+    session_id = int(callback.data.split("_")[3])
+    async with async_session() as session:
+        ts = await session.get(TestSession, session_id)
+        if not ts:
+            await callback.answer("Topilmadi!", show_alert=True)
+            return
+        test = await session.get(Test, ts.test_id)
+        student = await session.get(Student, ts.student_id)
+        pdf_bytes = generate_result_pdf(
+            f"{student.first_name} {student.last_name}",
+            test.title, test.subject,
+            ts.score, ts.score_percentage,
+            ts.correct_answers, ts.wrong_answers, ts.unanswered
+        )
+        doc = BufferedInputFile(pdf_bytes, filename=f"natija_{student.student_id}.pdf")
+        await bot.send_document(chat_id=callback.message.chat.id, document=doc, caption="📄 Sizning test natijangiz")
+        await callback.answer()
+
+
+@router.message(F.text == "🏫 Maktab reytingi")
+async def school_rating_menu(message: Message, state: FSMContext):
+    if await state.get_state() == TestProcessState.in_test.state:
+        return
+    async with async_session() as session:
+        tests = (await session.execute(select(Test))).scalars().all()
+        if not tests:
+            await message.answer("Hozircha testlar yo'q.")
+            return
+        kb = [[InlineKeyboardButton(
+            text=f"🏫 [{t.grade_level}] {t.subject}",
+            callback_data=f"school_rate_{t.id}"
+        )] for t in tests[:20]]
+        await message.answer("🏫 <b>Maktablar reytingi</b>\n\nTestni tanlang:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+
+@router.callback_query(F.data.startswith("school_rate_"))
+async def show_school_rating(callback: CallbackQuery):
+    test_id = int(callback.data.split("_")[2])
+    async with async_session() as session:
+        test = await session.get(Test, test_id)
+        rows = (await session.execute(
+            select(Student.school, func.avg(TestSession.score), func.count(TestSession.id))
+            .join(TestSession, Student.id == TestSession.student_id)
+            .where(TestSession.test_id == test_id, TestSession.status == "COMPLETED", Student.school.is_not(None))
+            .group_by(Student.school)
+            .order_by(func.avg(TestSession.score).desc())
+            .limit(15)
+        )).all()
+        if not rows:
+            await callback.message.edit_text("Bu test bo'yicha maktab natijalari yo'q.")
+            await callback.answer()
+            return
+        text = f"🏫 <b>Maktab reytingi: {test.subject}</b>\n\n"
+        for idx, (school, avg_score, cnt) in enumerate(rows, 1):
+            medal = "🥇" if idx == 1 else ("🥈" if idx == 2 else ("🥉" if idx == 3 else f"{idx}."))
+            text += f"{medal} <b>{school or '-'}</b> — o'rtacha <b>{round(float(avg_score or 0), 2)}</b> ({cnt} o'quvchi)\n"
+        await callback.message.edit_text(text)
+        await callback.answer()
+
+
+# ----- Admin: o'quvchini bloklash -----
+@router.callback_query(F.data.startswith("adm_block_"))
+async def admin_block_student(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        return
+    sid = int(callback.data.split("_")[2])
+    async with async_session() as session:
+        st = await session.get(Student, sid)
+        if not st:
+            await callback.answer("Topilmadi!", show_alert=True)
+            return
+        st.is_active = False
+        await session.commit()
+    await callback.answer("🚫 O'quvchi bloklandi!", show_alert=True)
+    try:
+        await callback.message.answer(f"🚫 <b>{st.first_name} {st.last_name}</b> bloklandi.")
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data.startswith("adm_unblock_"))
+async def admin_unblock_student(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        return
+    sid = int(callback.data.split("_")[2])
+    async with async_session() as session:
+        st = await session.get(Student, sid)
+        if not st:
+            await callback.answer("Topilmadi!", show_alert=True)
+            return
+        st.is_active = True
+        await session.commit()
+    await callback.answer("✅ Blokdan chiqarildi!", show_alert=True)
+    try:
+        await callback.message.answer(f"✅ <b>{st.first_name} {st.last_name}</b> blokdan chiqarildi.")
+    except Exception:
+        pass
+
+
+# ----- Admin: kanallar -----
+@router.message(F.text == "📢 Kanallar")
+async def admin_channels_prompt(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        return
+    current = await get_setting("required_channels", REQUIRED_CHANNEL)
+    await state.set_state(AdminChannelsState.waiting_for_channels)
+    await message.answer(
+        f"📢 <b>Majburiy kanallar</b>\n\nHozirgi: <code>{current}</code>\n\n"
+        f"Yangi ro'yxatni yuboring (vergul yoki yangi qator bilan):\n"
+        f"<code>@kanal1, @kanal2</code>\n\n(Bekor: 🏠 Asosiy menyu)",
+        reply_markup=get_cancel_to_menu_keyboard()
+    )
+
+
+@router.message(AdminChannelsState.waiting_for_channels)
+async def admin_save_channels(message: Message, state: FSMContext, bot: Bot):
+    if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
+        await cmd_start(message, state, bot)
+        return
+    if not await is_admin(message.from_user.id):
+        return
+    await set_setting("required_channels", message.text.strip())
+    await state.clear()
+    channels = await get_required_channels()
+    await message.answer(
+        f"✅ Kanallar saqlandi:\n" + "\n".join(f"• {c}" for c in channels),
+        reply_markup=get_admin_menu()
+    )
+
+
+# ----- Admin: test qoidalari -----
+@router.message(F.text == "📜 Test qoidalari")
+async def admin_rules_prompt(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        return
+    current = await get_setting("test_rules", "Qoidalar kiritilmagan.")
+    await state.set_state(AdminRulesState.waiting_for_rules)
+    await message.answer(
+        f"📜 <b>Test qoidalari</b>\n\nHozirgi:\n{current}\n\n"
+        f"Yangi qoidalarni yuboring (Bekor: 🏠 Asosiy menyu):",
+        reply_markup=get_cancel_to_menu_keyboard()
+    )
+
+
+@router.message(AdminRulesState.waiting_for_rules)
+async def admin_save_rules(message: Message, state: FSMContext, bot: Bot):
+    if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
+        await cmd_start(message, state, bot)
+        return
+    if not await is_admin(message.from_user.id):
+        return
+    await set_setting("test_rules", message.text.strip())
+    await state.clear()
+    await message.answer("✅ Test qoidalari saqlandi!", reply_markup=get_admin_menu())
+
+
+# ----- Test oldidan qoidalar (Roziman) -----
+@router.callback_query(F.data.startswith("rules_ok_test_"))
+async def rules_accepted_start_test(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    """Qoidalarga rozilik — oddiy testni boshlash."""
+    test_id = int(callback.data.split("_")[3])
+    # Reuse begin by faking data
+    callback.data = f"start_test_{test_id}"
+    await begin_test_session(callback, state, bot)
+
+
+@router.callback_query(F.data.startswith("rules_ok_block_"))
+async def rules_accepted_start_block(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    test_id = int(callback.data.split("_")[3])
+    callback.data = f"start_block_{test_id}"
+    await choose_block_subject_menu(callback, state)
+
+
+# ----- Clone test -----
+@router.callback_query(F.data.startswith("clone_test_"))
+async def clone_test(callback: CallbackQuery, bot: Bot):
+    if not await is_admin(callback.from_user.id):
+        return
+    test_id = int(callback.data.split("_")[2])
+    async with async_session() as session:
+        src = await session.get(Test, test_id)
+        if not src:
+            await callback.answer("Topilmadi!", show_alert=True)
+            return
+        questions = list((await session.execute(
+            select(Question).where(Question.test_id == src.id).order_by(Question.id)
+        )).scalars().all())
+        clone = Test(
+            title=src.title + " (nusxa)",
+            subject=src.subject,
+            grade_level=src.grade_level,
+            max_attempts=src.max_attempts,
+            mode=src.mode,
+            duration_minutes=src.duration_minutes,
+            question_time_seconds=src.question_time_seconds,
+            is_block_test=src.is_block_test,
+            block_subjects=src.block_subjects,
+            start_time=None,
+            end_time=None,
+            is_active=True,
+            is_finished=False,
+        )
+        session.add(clone)
+        await session.flush()
+        for q in questions:
+            session.add(Question(
+                test_id=clone.id,
+                section_name=q.section_name,
+                question_text=q.question_text,
+                photo_file_id=q.photo_file_id,
+                option_a=q.option_a,
+                option_b=q.option_b,
+                option_c=q.option_c,
+                option_d=q.option_d,
+                correct_option=q.correct_option,
+                points=q.points,
+            ))
+        await session.commit()
+        # Bildirishnoma: shu sinfdagi o'quvchilarga
+        if not src.is_block_test:
+            students = (await session.execute(
+                select(Student).where(
+                    Student.grade == clone.grade_level,
+                    Student.telegram_id.is_not(None),
+                    Student.is_active == True
+                )
+            )).scalars().all()
+        else:
+            students = (await session.execute(
+                select(Student).where(Student.telegram_id.is_not(None), Student.is_active == True)
+            )).scalars().all()
+        notified = 0
+        for st in students[:500]:
+            try:
+                await bot.send_message(
+                    st.telegram_id,
+                    f"📢 <b>Yangi test!</b>\n\n📚 {clone.subject} — {clone.title}\n"
+                    f"Sinf: {clone.grade_level}\n\nTestni boshlash uchun menyudan tanlang."
+                )
+                notified += 1
+                await asyncio.sleep(0.03)
+            except Exception:
+                pass
+    await callback.answer(f"✅ Nusxa yaratildi! {notified} o'quvchiga xabar.", show_alert=True)
+
+
+# ----- Savol tahrirlash (soddalashtirilgan) -----
+@router.callback_query(F.data.startswith("edit_qs_"))
+async def admin_edit_questions_start(callback: CallbackQuery, state: FSMContext):
+    if not await is_admin(callback.from_user.id):
+        return
+    test_id = int(callback.data.split("_")[2])
+    async with async_session() as session:
+        questions = list((await session.execute(
+            select(Question).where(Question.test_id == test_id).order_by(Question.id)
+        )).scalars().all())
+        if not questions:
+            await callback.answer("Savollar yo'q!", show_alert=True)
+            return
+        await state.update_data(edit_test_id=test_id)
+        kb = []
+        for i, q in enumerate(questions[:30], 1):
+            prev = (q.question_text[:40] + "…") if len(q.question_text) > 40 else q.question_text
+            kb.append([InlineKeyboardButton(text=f"{i}. {prev}", callback_data=f"edit_one_q_{q.id}")])
+        await callback.message.answer(
+            f"✏️ Tahrirlash uchun savolni tanlang ({len(questions)} ta):",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
+        )
+        await callback.answer()
+
+
+@router.callback_query(F.data.startswith("edit_one_q_"))
+async def admin_edit_one_question(callback: CallbackQuery, state: FSMContext):
+    if not await is_admin(callback.from_user.id):
+        return
+    qid = int(callback.data.split("_")[3])
+    async with async_session() as session:
+        q = await session.get(Question, qid)
+        if not q:
+            await callback.answer("Topilmadi!", show_alert=True)
+            return
+        await state.update_data(edit_question_id=qid)
+        await state.set_state(AdminEditQuestionState.waiting_for_new_text)
+        await callback.message.answer(
+            f"✏️ Hozirgi savol:\n<b>{q.question_text}</b>\n\n"
+            f"A) {q.option_a}\nB) {q.option_b}\nC) {q.option_c}\nD) {q.option_d}\n"
+            f"To'g'ri: {q.correct_option}\n\n"
+            f"Yangi matnni yuboring (format):\n"
+            f"<code>Savol matni\nA) ...\nB) ...\nC) ...\nD) ...\nTo'g'ri: A</code>\n\n"
+            f"(Bekor: 🏠 Asosiy menyu)",
+            reply_markup=get_cancel_to_menu_keyboard()
+        )
+        await callback.answer()
+
+
+@router.message(AdminEditQuestionState.waiting_for_new_text)
+async def admin_save_edited_question(message: Message, state: FSMContext, bot: Bot):
+    if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
+        await cmd_start(message, state, bot)
+        return
+    if not await is_admin(message.from_user.id):
+        return
+    data = await state.get_data()
+    qid = data.get("edit_question_id")
+    parsed = parse_single_question_text(message.text)
+    correct = "A"
+    m = re.search(r"to['']?g['']?ri\s*[:\-]\s*([A-D])", message.text, re.I)
+    if m:
+        correct = m.group(1).upper()
+    else:
+        tokens = re.findall(r'[A-D]', message.text.upper())
+        if tokens:
+            correct = tokens[-1]
+    async with async_session() as session:
+        q = await session.get(Question, qid)
+        if not q:
+            await message.answer("Savol topilmadi.")
+            await state.clear()
+            return
+        if parsed:
+            q.question_text = parsed["text"]
+            q.option_a = parsed["a"]
+            q.option_b = parsed["b"]
+            q.option_c = parsed.get("c") or "C"
+            q.option_d = parsed.get("d") or "D"
+        else:
+            q.question_text = message.text.strip()
+        q.correct_option = correct
+        await session.commit()
+    await state.clear()
+    await message.answer("✅ Savol yangilandi!", reply_markup=get_admin_menu())
+
+
 
 async def reminder_scheduler(bot: Bot):
     while True:
@@ -3145,6 +3736,39 @@ async def reminder_scheduler(bot: Bot):
                                     )
                                 except: pass
                             rem.reminded = True
+                await session.commit()
+
+            # Blok test: har ~30 daqiqada qolgan vaqt eslatmasi
+            async with async_session() as session:
+                active_blocks = (await session.execute(
+                    select(TestSession, Test, Student)
+                    .join(Test, TestSession.test_id == Test.id)
+                    .join(Student, TestSession.student_id == Student.id)
+                    .where(
+                        TestSession.status == "IN_PROGRESS",
+                        Test.is_block_test == True,
+                        Student.telegram_id.is_not(None)
+                    )
+                )).all()
+                for ts, t, st in active_blocks:
+                    started = ts.started_at
+                    if started.tzinfo is None:
+                        started = started.replace(tzinfo=timezone.utc)
+                    elapsed = (now - started).total_seconds()
+                    remaining = 180 * 60 - elapsed
+                    if remaining <= 0:
+                        continue
+                    # 30, 60, 90, 120, 150 daqiqada eslatma (taxminan)
+                    elapsed_min = int(elapsed // 60)
+                    if elapsed_min in (30, 60, 90, 120, 150) and (elapsed % 60) < 70:
+                        try:
+                            rem_m = int(remaining // 60)
+                            await bot.send_message(
+                                st.telegram_id,
+                                f"⏳ <b>Vaqt eslatmasi</b>\n\n🧩 {t.title}\nQolgan vaqt: <b>{rem_m} daqiqa</b>"
+                            )
+                        except Exception:
+                            pass
                 await session.commit()
         except Exception as e:
             logging.error(f"Reminder error: {e}")
