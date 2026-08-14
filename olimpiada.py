@@ -288,7 +288,7 @@ def phone_request_keyboard() -> ReplyKeyboardMarkup:
 
 
 def build_grade_keyboard(prefix: str = "reg") -> InlineKeyboardMarkup:
-    """5-sinf .. 11-sinf + Abituriyent."""
+    """5-11 sinf + Abituriyent (0 = Abituriyent)."""
     rows, row = [], []
     for i in range(5, 12):
         row.append(InlineKeyboardButton(text=f"{i}-sinf", callback_data=f"{prefix}_grade_{i}"))
@@ -297,25 +297,21 @@ def build_grade_keyboard(prefix: str = "reg") -> InlineKeyboardMarkup:
             row = []
     if row:
         rows.append(row)
-    # Abituriyent — alohida aniq callback (reg/pedit)
-    ab_cb = "regabitur" if prefix == "reg" else "peditabitur"
-    rows.append([InlineKeyboardButton(text="🎓 Abituriyent", callback_data=ab_cb)])
+    rows.append([InlineKeyboardButton(text="Abituriyent", callback_data=f"{prefix}_grade_0")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+
 def grade_code_to_label(code: str) -> str:
-    """Callback kodini sinf nomiga aylantirish."""
-    code = (code or "").strip()
-    if code.lower() in ("abitur", "abituriyent"):
+    code = (code or "").strip().lower()
+    if code in ("0", "abitur", "abituriyent"):
         return "Abituriyent"
     if code.isdigit() and 5 <= int(code) <= 11:
         return f"{int(code)}-sinf"
-    # eski format: to'liq nom kelib qolgan bo'lsa
-    if "abitur" in code.lower():
-        return "Abituriyent"
     if code.endswith("-sinf"):
         return code
     return code
+
 
 
 def build_school_keyboard(prefix: str = "reg", page: int = 0, per_page: int = 20) -> InlineKeyboardMarkup:
@@ -847,78 +843,47 @@ async def reg_pick_age(callback: CallbackQuery, state: FSMContext):
 
 
 
-@router.callback_query(
-    F.data.in_({
-        "regabitur",
-        "reg_grade_abitur",
-        "reg_grade_Abituriyent",
-        "reg_grade_abituriyent",
-    })
-)
-async def reg_pick_abituriyent(callback: CallbackQuery, state: FSMContext):
-    """Abituriyent -> telefon so'rash. Har doim javob beradi."""
+@router.callback_query(F.data.startswith("reg_grade_"))
+async def reg_pick_grade(callback: CallbackQuery, state: FSMContext):
+    """Sinf yoki Abituriyent (reg_grade_0)."""
     try:
         await callback.answer()
     except Exception:
         pass
 
-    data = await state.get_data()
-    fullname = data.get("fullname")
-    age = data.get("age")
+    code = (callback.data or "").replace("reg_grade_", "", 1).strip()
+    grade = grade_code_to_label(code)
 
-    if not fullname or not age:
+    data = await state.get_data()
+    if not data.get("fullname") or not data.get("age"):
         await state.set_state(SelfRegState.waiting_for_fullname)
         try:
-            await callback.message.edit_text(
-                "⚠️ Sessiya tugagan. Iltimos, ism-familiyangizni qayta yuboring:"
-            )
+            await callback.message.edit_text("⚠️ Sessiya tugagan. Ism-familiyangizni yuboring:")
         except Exception:
-            await callback.message.answer(
-                "⚠️ Sessiya tugagan. Iltimos, ism-familiyangizni qayta yuboring:"
-            )
+            await callback.message.answer("⚠️ Sessiya tugagan. Ism-familiyangizni yuboring:")
         return
 
-    await state.update_data(grade="Abituriyent", school="-")
-    await state.set_state(SelfRegState.waiting_for_phone)
-
-    try:
-        await callback.message.edit_text(
-            "✅ Holat: <b>Abituriyent</b>\n\n📱 Endi telefon raqamingizni yuboring."
-        )
-    except Exception:
+    # ===== ABITURIYENT -> TELEFON =====
+    if grade == "Abituriyent" or code in ("0", "abitur", "abituriyent"):
+        await state.update_data(grade="Abituriyent", school="-")
+        await state.set_state(SelfRegState.waiting_for_phone)
+        kb = phone_request_keyboard()
         try:
-            await callback.message.answer(
-                "✅ Holat: <b>Abituriyent</b>\n\n📱 Endi telefon raqamingizni yuboring."
+            await callback.message.edit_text(
+                "✅ Siz <b>Abituriyent</b> ni tanladingiz.\n\n"
+                "📱 Endi telefon raqamingizni yuboring."
             )
         except Exception:
             pass
-
-    try:
         await callback.message.answer(
             "📱 <b>Telefon raqamini yuboring</b>\n\n"
-            "Pastdagi tugmani bosing:\n"
-            "<b>📱 Telefon raqamni yuborish</b>\n\n"
-            "⚠️ Raqam yuborilmaguncha ro'yxatdan o'tish tugamaydi.",
-            reply_markup=phone_request_keyboard()
+            "1) Pastdagi <b>📱 Telefon raqamni yuborish</b> tugmasini bosing\n"
+            "2) Yoki raqamni yozing: <code>+998901234567</code>",
+            reply_markup=kb
         )
-    except Exception:
-        await callback.message.answer(
-            "📱 Telefon raqamingizni yozib yuboring (masalan: +998901234567):"
-        )
-
-
-@router.callback_query(F.data.startswith("reg_grade_"))
-async def reg_pick_grade(callback: CallbackQuery, state: FSMContext):
-    """5-11 sinf tanlash."""
-    raw = (callback.data or "")
-    if "abitur" in raw.lower():
-        await reg_pick_abituriyent(callback, state)
         return
-    if await state.get_state() != SelfRegState.waiting_for_grade.state:
-        await callback.answer()
-        return
-    code = raw.replace("reg_grade_", "", 1)
-    grade = grade_code_to_label(code)
+
+    # ===== ODIY SINF -> MAKTAB =====
     await state.update_data(grade=grade)
     await state.set_state(SelfRegState.waiting_for_school)
     try:
@@ -931,37 +896,6 @@ async def reg_pick_grade(callback: CallbackQuery, state: FSMContext):
             f"✅ Sinf: <b>{grade}</b>\n\n🏫 Maktabingizni tanlang (1–102):",
             reply_markup=build_school_keyboard("reg", 0)
         )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("reg_grade_"))
-async def reg_pick_grade(callback: CallbackQuery, state: FSMContext):
-    """Faqat 5-11 sinf. Abituriyent alohida handlerda."""
-    if await state.get_state() != SelfRegState.waiting_for_grade.state:
-        await callback.answer()
-        return
-    code = callback.data.replace("reg_grade_", "", 1)
-    # Agar eski "abitur" callback kelib qolsa
-    if code.lower() in ("abitur", "abituriyent"):
-        await reg_pick_abituriyent(callback, state)
-        return
-    grade = grade_code_to_label(code)
-    if grade == "Abituriyent":
-        await reg_pick_abituriyent(callback, state)
-        return
-    await state.update_data(grade=grade)
-    await state.set_state(SelfRegState.waiting_for_school)
-    try:
-        await callback.message.edit_text(
-            f"✅ Sinf: <b>{grade}</b>\n\n🏫 Maktabingizni tanlang (1–102):",
-            reply_markup=build_school_keyboard("reg", 0)
-        )
-    except Exception:
-        await callback.message.answer(
-            f"✅ Sinf: <b>{grade}</b>\n\n🏫 Maktabingizni tanlang (1–102):",
-            reply_markup=build_school_keyboard("reg", 0)
-        )
-    await callback.answer()
 
 
 @router.message(SelfRegState.waiting_for_phone, F.contact)
