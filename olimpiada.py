@@ -6,7 +6,8 @@ import os
 import re
 import json
 from datetime import datetime, timedelta, timezone
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import Bot, Dispatcher, F, Router, BaseMiddleware
+from typing import Callable, Dict, Any, Awaitable
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
@@ -628,6 +629,51 @@ class AdminEditQuestionState(StatesGroup):
     waiting_for_new_text = State()
 
 router = Router()
+
+
+class BlockedStudentMiddleware(BaseMiddleware):
+    """Bloklangan o'quvchi botdan foydalana olmasin (adminlar bundan mustasno)."""
+
+    async def __call__(
+        self,
+        handler: Callable[[Any, Dict[str, Any]], Awaitable[Any]],
+        event: Any,
+        data: Dict[str, Any],
+    ) -> Any:
+        user = data.get("event_from_user")
+        if not user:
+            return await handler(event, data)
+        if user.id in SUPER_ADMIN_IDS:
+            return await handler(event, data)
+        # admin jadvalidagi moderatorlar ham o'tsin
+        try:
+            if await is_admin(user.id):
+                return await handler(event, data)
+        except Exception:
+            pass
+        try:
+            async with async_session() as session:
+                student = (await session.execute(
+                    select(Student).where(Student.telegram_id == user.id)
+                )).scalar_one_or_none()
+                if student is not None and not student.is_active:
+                    msg = "❌ Sizning profilingiz administrator tomonidan bloklangan. Botdan foydalana olmaysiz."
+                    try:
+                        if isinstance(event, CallbackQuery):
+                            await event.answer(msg, show_alert=True)
+                        elif isinstance(event, Message):
+                            await event.answer(msg)
+                    except Exception:
+                        pass
+                    return None
+        except Exception:
+            pass
+        return await handler(event, data)
+
+
+router.message.middleware(BlockedStudentMiddleware())
+router.callback_query.middleware(BlockedStudentMiddleware())
+
 
 # Istalgan FSM holatida ham ishlashi uchun eng yuqorida
 @router.message(F.text == "🏠 Asosiy menyu")
@@ -3854,10 +3900,11 @@ async def show_school_rating(callback: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("adm_block_"))
-async def admin_block_student(callback: CallbackQuery):
+async def admin_block_student(callback: CallbackQuery, bot: Bot):
     if not await is_admin(callback.from_user.id):
         return
     sid = int(callback.data.split("_")[2])
+    tg_id = None
     async with async_session() as session:
         st = await session.get(Student, sid)
         if not st:
@@ -3866,18 +3913,28 @@ async def admin_block_student(callback: CallbackQuery):
         st.is_active = False
         await session.commit()
         name = f"{st.first_name} {st.last_name}"
+        tg_id = st.telegram_id
     await callback.answer("🚫 Bloklandi!", show_alert=True)
     try:
-        await callback.message.answer(f"🚫 <b>{name}</b> bloklandi.")
+        await callback.message.answer(f"🚫 <b>{name}</b> bloklandi. U endi botdan foydalana olmaydi.")
     except Exception:
         pass
+    if tg_id:
+        try:
+            await bot.send_message(
+                tg_id,
+                "❌ Sizning profilingiz administrator tomonidan <b>bloklandi</b>.\nBotdan foydalana olmaysiz."
+            )
+        except Exception:
+            pass
 
 
 @router.callback_query(F.data.startswith("adm_unblock_"))
-async def admin_unblock_student(callback: CallbackQuery):
+async def admin_unblock_student(callback: CallbackQuery, bot: Bot):
     if not await is_admin(callback.from_user.id):
         return
     sid = int(callback.data.split("_")[2])
+    tg_id = None
     async with async_session() as session:
         st = await session.get(Student, sid)
         if not st:
@@ -3886,11 +3943,20 @@ async def admin_unblock_student(callback: CallbackQuery):
         st.is_active = True
         await session.commit()
         name = f"{st.first_name} {st.last_name}"
+        tg_id = st.telegram_id
     await callback.answer("✅ Blok ochildi!", show_alert=True)
     try:
         await callback.message.answer(f"✅ <b>{name}</b> blokdan chiqarildi.")
     except Exception:
         pass
+    if tg_id:
+        try:
+            await bot.send_message(
+                tg_id,
+                "✅ Profilingiz <b>blokdan chiqarildi</b>.\nBotdan yana foydalanishingiz mumkin. /start bosing."
+            )
+        except Exception:
+            pass
 
 
 @router.message(F.text == "📢 Kanallar")
