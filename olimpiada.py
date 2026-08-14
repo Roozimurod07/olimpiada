@@ -424,13 +424,17 @@ def build_admin_grade_keyboard(selected: list = None) -> InlineKeyboardMarkup:
 
 
 async def send_question_media(bot, chat_id, photo_raw, text_content, reply_markup=None):
-    """Bitta yoki bir nechta rasm bilan savol yuborish."""
+    """Bitta yoki bir nechta rasm bilan savol yuborish.
+    Qaytaradi: (asosiy_xabar, [barcha message_id lar]) — javobdan keyin hammasini o'chirish uchun.
+    """
     ids = parse_photo_ids(photo_raw)
     if not ids:
-        return await bot.send_message(chat_id=chat_id, text=text_content, reply_markup=reply_markup)
+        msg = await bot.send_message(chat_id=chat_id, text=text_content, reply_markup=reply_markup)
+        return msg, [msg.message_id]
     if len(ids) == 1:
-        return await bot.send_photo(chat_id=chat_id, photo=ids[0], caption=text_content, reply_markup=reply_markup)
-    # media group — reply_markup alohida
+        msg = await bot.send_photo(chat_id=chat_id, photo=ids[0], caption=text_content, reply_markup=reply_markup)
+        return msg, [msg.message_id]
+    # media group — reply_markup alohida xabarda
     from aiogram.types import InputMediaPhoto
     media = []
     for i, pid in enumerate(ids[:10]):
@@ -438,8 +442,24 @@ async def send_question_media(bot, chat_id, photo_raw, text_content, reply_marku
             media.append(InputMediaPhoto(media=pid, caption=text_content))
         else:
             media.append(InputMediaPhoto(media=pid))
-    await bot.send_media_group(chat_id=chat_id, media=media)
-    return await bot.send_message(chat_id=chat_id, text="👆 Savol rasmlari. Javobni tanlang:", reply_markup=reply_markup)
+    group_msgs = await bot.send_media_group(chat_id=chat_id, media=media)
+    msg_ids = [m.message_id for m in group_msgs]
+    msg = await bot.send_message(chat_id=chat_id, text="👆 Savol rasmlari. Javobni tanlang:", reply_markup=reply_markup)
+    msg_ids.append(msg.message_id)
+    return msg, msg_ids
+
+
+async def delete_messages_safe(bot, chat_id, message_ids):
+    """Bir nechta xabarni (rasm + tugmalar) o'chirish."""
+    if not message_ids:
+        return
+    for mid in message_ids:
+        if not mid:
+            continue
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=mid)
+        except Exception:
+            pass
 
 
 async def get_blok_test_status() -> str:
@@ -731,6 +751,7 @@ async def asosiy_menu_like_start(message: Message, state: FSMContext, bot: Bot):
 
 user_next_question_flags = {}
 user_abort_test_flags = {}  # user_id -> True if left to main menu during test
+user_question_msg_ids = {}  # user_id -> [message_id, ...] joriy savol xabarlari (rasm+tugma)
 
 async def get_main_menu_keyboard():
     keyboard = [
@@ -1769,9 +1790,11 @@ async def send_next_block_question(bot: Bot, chat_id: int, ts_id: int, test_id: 
 
         await state.set_state(TestProcessState.in_test)
         try:
-            await send_question_media(bot, chat_id, next_q.photo_file_id, text_content, markup)
+            _, msg_ids = await send_question_media(bot, chat_id, next_q.photo_file_id, text_content, markup)
+            user_question_msg_ids[chat_id] = msg_ids
         except Exception:
-            await bot.send_message(chat_id=chat_id, text=text_content, reply_markup=markup)
+            m = await bot.send_message(chat_id=chat_id, text=text_content, reply_markup=markup)
+            user_question_msg_ids[chat_id] = [m.message_id]
         return False
 
 
@@ -1909,8 +1932,16 @@ async def run_block_subject_questions(callback: CallbackQuery, state: FSMContext
 
 
 @router.callback_query(F.data.startswith("back_to_block_menu_"))
-async def return_to_block_menu(callback: CallbackQuery, state: FSMContext):
+async def return_to_block_menu(callback: CallbackQuery, state: FSMContext, bot: Bot):
     test_id = int(callback.data.split("_")[4])
+    # Joriy savol rasmlarini ham o'chirish
+    uid = callback.from_user.id
+    msg_ids = user_question_msg_ids.pop(uid, None) or []
+    if callback.message:
+        mid = callback.message.message_id
+        if mid not in msg_ids:
+            msg_ids.append(mid)
+    await delete_messages_safe(bot, uid, msg_ids)
     async with async_session() as session:
         student = (await session.execute(select(Student).where(Student.telegram_id == callback.from_user.id))).scalar_one_or_none()
         test = await session.get(Test, test_id)
@@ -1995,11 +2026,14 @@ async def save_block_answer(callback: CallbackQuery, state: FSMContext, bot: Bot
 
     await callback.answer(f"✅ {selected}")
 
-    # Javob berilgan savol xabarini o'chirish
-    try:
-        await callback.message.delete()
-    except Exception:
-        pass
+    # Javob berilgan savol + rasmlarni o'chirish
+    uid = callback.from_user.id
+    msg_ids = user_question_msg_ids.pop(uid, None) or []
+    if callback.message:
+        mid = callback.message.message_id
+        if mid not in msg_ids:
+            msg_ids.append(mid)
+    await delete_messages_safe(bot, uid, msg_ids)
 
     # Keyingi savol yoki fan tugadi
     result = await send_next_block_question(bot, callback.from_user.id, session_id, test_id, section, state)
@@ -2246,9 +2280,11 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
             text_content = f"{sec_title}<b>Savol {index + 1} / {len(questions)}</b> (Ball: {q.points})\n\n{q.question_text}"
             
             try:
-                q_msg = await send_question_media(bot, user_id, q.photo_file_id, text_content, markup)
+                q_msg, q_msg_ids = await send_question_media(bot, user_id, q.photo_file_id, text_content, markup)
             except Exception:
                 q_msg = await bot.send_message(chat_id=user_id, text=text_content, reply_markup=markup)
+                q_msg_ids = [q_msg.message_id]
+            user_question_msg_ids[user_id] = list(q_msg_ids)
 
             q_start_time = datetime.now(timezone.utc)
             timer_msg = await bot.send_message(
@@ -2297,10 +2333,11 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
                 await bot.delete_message(chat_id=user_id, message_id=timer_msg.message_id)
             except Exception:
                 pass
-            try:
-                await bot.delete_message(chat_id=user_id, message_id=q_msg.message_id)
-            except Exception:
-                pass
+            # Savol + barcha rasmlarni o'chirish
+            ids_to_del = user_question_msg_ids.pop(user_id, None) or list(q_msg_ids)
+            if q_msg and q_msg.message_id not in ids_to_del:
+                ids_to_del.append(q_msg.message_id)
+            await delete_messages_safe(bot, user_id, ids_to_del)
 
             if aborted or user_abort_test_flags.pop(user_id, None):
                 break
@@ -2368,6 +2405,14 @@ async def save_answer(callback: CallbackQuery, bot: Bot):
         await session.commit()
 
     user_next_question_flags[callback.from_user.id] = {"target_index": None}
+    # Rasmli savolni darhol o'chirish (keyingi savol kelguncha ekranda qolmasin)
+    uid = callback.from_user.id
+    msg_ids = user_question_msg_ids.pop(uid, None) or []
+    if callback.message:
+        mid = callback.message.message_id
+        if mid not in msg_ids:
+            msg_ids.append(mid)
+    await delete_messages_safe(bot, uid, msg_ids)
     await callback.answer(f"Tanlandi: {selected}")
 
 async def calculate_and_save_results(session, sess: TestSession):
