@@ -847,33 +847,91 @@ async def reg_pick_age(callback: CallbackQuery, state: FSMContext):
 
 
 
-@router.callback_query(F.data == "regabitur")
+@router.callback_query(
+    F.data.in_({
+        "regabitur",
+        "reg_grade_abitur",
+        "reg_grade_Abituriyent",
+        "reg_grade_abituriyent",
+    })
+)
 async def reg_pick_abituriyent(callback: CallbackQuery, state: FSMContext):
-    """Abituriyent tanlandi -> majburiy telefon so'rash (maktab YO'Q, menyu YO'Q)."""
-    st = await state.get_state()
-    if st != SelfRegState.waiting_for_grade.state:
-        # Hatto state boshqacha bo'lsa ham telefon so'raymiz agar fullname/age bor bo'lsa
-        data = await state.get_data()
-        if not data.get("fullname") or not data.get("age"):
-            await callback.answer("Avval ism va yoshni kiriting. /start", show_alert=True)
-            return
-    await state.update_data(grade="Abituriyent", school="-")
-    await state.set_state(SelfRegState.waiting_for_phone)
+    """Abituriyent -> telefon so'rash. Har doim javob beradi."""
     try:
-        await callback.message.edit_text(
-            "✅ Holat: <b>Abituriyent</b>\n\n"
-            "Endi telefon raqamingizni yuboring."
-        )
+        await callback.answer()
     except Exception:
         pass
-    await callback.message.answer(
-        "📱 <b>Telefon raqamini yuboring</b>\n\n"
-        "Pastdagi tugmani bosing:\n"
-        "<b>📱 Telefon raqamni yuborish</b>\n\n"
-        "⚠️ Raqam yuborilmaguncha ro'yxatdan o'tish tugamaydi.",
-        reply_markup=phone_request_keyboard()
-    )
-    await callback.answer("Telefon raqamini yuboring")
+
+    data = await state.get_data()
+    fullname = data.get("fullname")
+    age = data.get("age")
+
+    if not fullname or not age:
+        await state.set_state(SelfRegState.waiting_for_fullname)
+        try:
+            await callback.message.edit_text(
+                "⚠️ Sessiya tugagan. Iltimos, ism-familiyangizni qayta yuboring:"
+            )
+        except Exception:
+            await callback.message.answer(
+                "⚠️ Sessiya tugagan. Iltimos, ism-familiyangizni qayta yuboring:"
+            )
+        return
+
+    await state.update_data(grade="Abituriyent", school="-")
+    await state.set_state(SelfRegState.waiting_for_phone)
+
+    try:
+        await callback.message.edit_text(
+            "✅ Holat: <b>Abituriyent</b>\n\n📱 Endi telefon raqamingizni yuboring."
+        )
+    except Exception:
+        try:
+            await callback.message.answer(
+                "✅ Holat: <b>Abituriyent</b>\n\n📱 Endi telefon raqamingizni yuboring."
+            )
+        except Exception:
+            pass
+
+    try:
+        await callback.message.answer(
+            "📱 <b>Telefon raqamini yuboring</b>\n\n"
+            "Pastdagi tugmani bosing:\n"
+            "<b>📱 Telefon raqamni yuborish</b>\n\n"
+            "⚠️ Raqam yuborilmaguncha ro'yxatdan o'tish tugamaydi.",
+            reply_markup=phone_request_keyboard()
+        )
+    except Exception:
+        await callback.message.answer(
+            "📱 Telefon raqamingizni yozib yuboring (masalan: +998901234567):"
+        )
+
+
+@router.callback_query(F.data.startswith("reg_grade_"))
+async def reg_pick_grade(callback: CallbackQuery, state: FSMContext):
+    """5-11 sinf tanlash."""
+    raw = (callback.data or "")
+    if "abitur" in raw.lower():
+        await reg_pick_abituriyent(callback, state)
+        return
+    if await state.get_state() != SelfRegState.waiting_for_grade.state:
+        await callback.answer()
+        return
+    code = raw.replace("reg_grade_", "", 1)
+    grade = grade_code_to_label(code)
+    await state.update_data(grade=grade)
+    await state.set_state(SelfRegState.waiting_for_school)
+    try:
+        await callback.message.edit_text(
+            f"✅ Sinf: <b>{grade}</b>\n\n🏫 Maktabingizni tanlang (1–102):",
+            reply_markup=build_school_keyboard("reg", 0)
+        )
+    except Exception:
+        await callback.message.answer(
+            f"✅ Sinf: <b>{grade}</b>\n\n🏫 Maktabingizni tanlang (1–102):",
+            reply_markup=build_school_keyboard("reg", 0)
+        )
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("reg_grade_"))
@@ -949,11 +1007,43 @@ async def reg_receive_phone_text(message: Message, state: FSMContext, bot: Bot):
     if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
         await cmd_start(message, state, bot)
         return
-    # Faqat contact tugmasi orqali
+    # Matn sifatida raqam ham qabul qilinadi
+    raw = (message.text or "").strip().replace(" ", "")
+    digits = re.sub(r"[^\d+]", "", raw)
+    if len(re.sub(r"\D", "", digits)) < 9:
+        await message.answer(
+            "📱 Raqam noto'g'ri. Pastdagi <b>«Telefon raqamni yuborish»</b> tugmasini bosing\n"
+            "yoki raqamni yozing: <code>+998901234567</code>",
+            reply_markup=phone_request_keyboard()
+        )
+        return
+    phone = digits if digits.startswith("+") else ("+" + digits if digits.startswith("998") else "+998" + digits.lstrip("0"))
+    data = await state.get_data()
+    fullname_parts = data["fullname"].split(" ", 1)
+    first_name = fullname_parts[0]
+    last_name = fullname_parts[1] if len(fullname_parts) > 1 else "-"
+    unique_id = f"OLM-2026-{''.join(random.choices('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', k=6))}"
+    async with async_session() as session:
+        student = Student(
+            student_id=unique_id,
+            first_name=first_name,
+            last_name=last_name,
+            age=data["age"],
+            grade="Abituriyent",
+            school="-",
+            phone=phone,
+            telegram_id=message.from_user.id
+        )
+        session.add(student)
+        await session.commit()
+    await state.clear()
+    main_menu = await get_main_menu_keyboard()
     await message.answer(
-        "📱 Iltimos, pastdagi <b>«Telefon raqamni yuborish»</b> tugmasini bosing.\n"
-        "Raqamni qo'lda yozish shart emas.",
-        reply_markup=phone_request_keyboard()
+        f"✅ Muvaffaqiyatli ro'yxatdan o'tdingiz!\n"
+        f"ID: <code>{unique_id}</code>\n"
+        f"Holat: Abituriyent\n"
+        f"Tel: <code>{phone}</code>",
+        reply_markup=main_menu
     )
 
 
