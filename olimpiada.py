@@ -285,18 +285,22 @@ def build_grade_reply_keyboard() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="5-sinf"), KeyboardButton(text="6-sinf"), KeyboardButton(text="7-sinf")],
             [KeyboardButton(text="8-sinf"), KeyboardButton(text="9-sinf"), KeyboardButton(text="10-sinf")],
             [KeyboardButton(text="11-sinf"), KeyboardButton(text="Abituriyent")],
+            [KeyboardButton(text="🏠 Asosiy menyu")],
         ],
         resize_keyboard=True,
-        one_time_keyboard=True
+        one_time_keyboard=False
     )
 
 
 def phone_request_keyboard() -> ReplyKeyboardMarkup:
     """Telegram orqali telefon raqamini yuborish tugmasi (faqat contact)."""
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📱 Telefon raqamni yuborish", request_contact=True)]],
+        keyboard=[
+            [KeyboardButton(text="📱 Telefon raqamni yuborish", request_contact=True)],
+            [KeyboardButton(text="🏠 Asosiy menyu")],
+        ],
         resize_keyboard=True,
-        one_time_keyboard=True
+        one_time_keyboard=False
     )
 
 
@@ -842,10 +846,17 @@ async def process_self_fullname(message: Message, state: FSMContext, bot: Bot):
 
 @router.callback_query(F.data.startswith("reg_age_"))
 async def reg_pick_age(callback: CallbackQuery, state: FSMContext):
-    if await state.get_state() != SelfRegState.waiting_for_age.state:
-        await callback.answer()
-        return
+    # State qat'iy bo'lmasa ham yoshni qabul qilamiz
     age = callback.data.replace("reg_age_", "", 1)
+    data = await state.get_data()
+    if not data.get("fullname"):
+        await state.set_state(SelfRegState.waiting_for_fullname)
+        await callback.answer()
+        try:
+            await callback.message.answer("⚠️ Avval ism-familiyangizni yuboring:")
+        except Exception:
+            pass
+        return
     await state.update_data(age=age)
     await state.set_state(SelfRegState.waiting_for_grade)
     try:
@@ -870,14 +881,15 @@ async def reg_grade_from_text(message: Message, state: FSMContext, bot: Bot):
         return
 
     choice = (message.text or "").strip()
+    choice_norm = choice.lower().replace(" ", "").replace("'", "").replace("ʼ", "")
     data = await state.get_data()
     if not data.get("fullname") or not data.get("age"):
         await state.set_state(SelfRegState.waiting_for_fullname)
         await message.answer("⚠️ Sessiya tugagan. Ism-familiyangizni yuboring:")
         return
 
-    # ABITURIYENT
-    if choice.lower() == "abituriyent" or choice == "Abituriyent":
+    # ABITURIYENT — maktab so'ralmaydi, to'g'ridan-to'g'ri telefon
+    if "abitur" in choice_norm:
         await state.update_data(grade="Abituriyent", school="-")
         await state.set_state(SelfRegState.waiting_for_phone)
         await message.answer(
@@ -907,6 +919,32 @@ async def reg_grade_from_text(message: Message, state: FSMContext, bot: Bot):
     )
 
 
+# Fallback: state yo'qolgan bo'lsa ham Abituriyent -> telefon
+@router.message(F.text.regexp(r"(?i)^\s*abitur"))
+async def reg_abituriyent_fallback(message: Message, state: FSMContext, bot: Bot):
+    st = await state.get_state()
+    if st and not str(st).startswith("SelfRegState"):
+        return
+    data = await state.get_data()
+    if not data.get("fullname") or not data.get("age"):
+        return
+    if st == SelfRegState.waiting_for_phone.state:
+        await message.answer(
+            "📱 Telefon raqamini yuboring (tugma yoki +998...):",
+            reply_markup=phone_request_keyboard()
+        )
+        return
+    await state.update_data(grade="Abituriyent", school="-")
+    await state.set_state(SelfRegState.waiting_for_phone)
+    await message.answer(
+        "✅ Siz <b>Abituriyent</b> ni tanladingiz.\n\n"
+        "📱 <b>Telefon raqamini yuboring</b>\n\n"
+        "Pastdagi <b>📱 Telefon raqamni yuborish</b> tugmasini bosing\n"
+        "yoki raqamni yozing: <code>+998901234567</code>",
+        reply_markup=phone_request_keyboard()
+    )
+
+
 @router.callback_query(F.data.startswith("reg_grade_"))
 async def reg_pick_grade(callback: CallbackQuery, state: FSMContext):
     """Sinf yoki Abituriyent (reg_grade_0)."""
@@ -927,8 +965,8 @@ async def reg_pick_grade(callback: CallbackQuery, state: FSMContext):
             await callback.message.answer("⚠️ Sessiya tugagan. Ism-familiyangizni yuboring:")
         return
 
-    # ===== ABITURIYENT -> TELEFON =====
-    if grade == "Abituriyent" or code in ("0", "abitur", "abituriyent"):
+    # ===== ABITURIYENT -> TELEFON (maktab so'ralmaydi) =====
+    if grade == "Abituriyent" or str(code).lower() in ("0", "abitur", "abituriyent") or "abitur" in str(grade).lower():
         await state.update_data(grade="Abituriyent", school="-")
         await state.set_state(SelfRegState.waiting_for_phone)
         kb = phone_request_keyboard()
@@ -2500,7 +2538,9 @@ async def admin_show_grade_rating(callback: CallbackQuery):
 async def admin_search_student_prompt(message: Message, state: FSMContext):
     if not await is_admin(message.from_user.id): return
     await state.set_state(AdminSearchStudentState.waiting_for_query)
-    await message.answer("🔍 Qidirilayotgan o'quvchining <b>Ism, Familiyasi</b> yoki <b>ID raqamini</b> yuboring:")
+    await message.answer(
+        "🔍 Qidirish: <b>Ism, Familiya</b>, <b>ID</b>, <b>telefon</b> yoki <b>Telegram ID</b> yuboring:"
+    )
 
 @router.message(AdminSearchStudentState.waiting_for_query)
 async def admin_perform_student_search(message: Message, state: FSMContext, bot: Bot):
@@ -2510,26 +2550,43 @@ async def admin_perform_student_search(message: Message, state: FSMContext, bot:
     if not await is_admin(message.from_user.id): return
     query = message.text.strip()
     await state.clear()
-    
+
+    digits = re.sub(r"\D", "", query)
+    filt = (
+        (Student.student_id.ilike(f"%{query}%")) |
+        (Student.first_name.ilike(f"%{query}%")) |
+        (Student.last_name.ilike(f"%{query}%")) |
+        ((Student.first_name + " " + Student.last_name).ilike(f"%{query}%")) |
+        (Student.phone.ilike(f"%{query}%")) |
+        (Student.school.ilike(f"%{query}%")) |
+        (Student.grade.ilike(f"%{query}%"))
+    )
+    if digits:
+        filt = filt | (Student.phone.ilike(f"%{digits}%"))
+        try:
+            filt = filt | (Student.telegram_id == int(digits))
+        except Exception:
+            pass
+
     async with async_session() as session:
-        students = (await session.execute(
-            select(Student).where(
-                (Student.student_id.ilike(f"%{query}%")) |
-                (Student.first_name.ilike(f"%{query}%")) |
-                (Student.last_name.ilike(f"%{query}%")) |
-                ((Student.first_name + " " + Student.last_name).ilike(f"%{query}%"))
-            )
-        )).scalars().all()
-        
+        students = (await session.execute(select(Student).where(filt))).scalars().all()
+
         if not students:
             await message.answer("❌ Bunday o'quvchi topilmadi.")
             return
-            
+
         keyboard = []
-        for st in students:
-            keyboard.append([InlineKeyboardButton(text=f"👤 {st.first_name} {st.last_name} ({st.student_id})", callback_data=f"adm_st_detail_{st.id}")])
-            
-        await message.answer(f"🔍 Topilgan o'quvchilar ({len(students)} ta):", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+        for st in students[:30]:
+            extra = f" | {st.phone}" if st.phone else ""
+            keyboard.append([InlineKeyboardButton(
+                text=f"👤 {st.first_name} {st.last_name} ({st.student_id}){extra}"[:64],
+                callback_data=f"adm_st_detail_{st.id}"
+            )])
+
+        await message.answer(
+            f"🔍 Topilgan o'quvchilar ({len(students)} ta):",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
+        )
 
 @router.callback_query(F.data.startswith("adm_st_detail_"))
 async def admin_student_details(callback: CallbackQuery):
@@ -2543,13 +2600,17 @@ async def admin_student_details(callback: CallbackQuery):
         )).all()
         
         status_st = "🟢 Faol" if student.is_active else "🚫 Bloklangan"
-        text = f"👤 <b>O'quvchi ma'lumotlari:</b>\n\n" \
-               f"F.I.Sh: <b>{student.first_name} {student.last_name}</b>\n" \
-               f"ID: <code>{student.student_id}</code>\n" \
-               f"Sinf: {student.grade or '-'} | Yosh: {student.age or '-'}\n" \
-               f"Maktab: {student.school or '-'}\n" \
-               f"Holat: {status_st}\n\n" \
-               f"📊 <b>Ishlagan testlari</b> (bosib tahlilni oching):"
+        text = (
+            f"👤 <b>O'quvchi ma'lumotlari:</b>\n\n"
+            f"F.I.Sh: <b>{student.first_name} {student.last_name}</b>\n"
+            f"ID: <code>{student.student_id}</code>\n"
+            f"Telegram ID: <code>{student.telegram_id or '-'}</code>\n"
+            f"Telefon: <code>{student.phone or '-'}</code>\n"
+            f"Sinf: {student.grade or '-'} | Yosh: {student.age or '-'}\n"
+            f"Maktab: {student.school or '-'}\n"
+            f"Holat: {status_st}\n\n"
+            f"📊 <b>Ishlagan testlari</b> (bosib tahlilni oching):"
+        )
                
         if not sessions:
             text += "\nHali test ishlamagan."
@@ -3916,7 +3977,8 @@ async def export_excel_results(message: Message, bot: Bot):
             return
         df = pd.DataFrame([{
             "ID": s.student_id, "Ism": s.first_name, "Familiya": s.last_name, "Yosh": s.age, "Maktab": s.school,
-            "Sinf": s.grade, "Fan": t.subject, "Ball": ts.score, "Foiz": ts.score_percentage, "Sana": ts.finished_at
+            "Sinf": s.grade, "Telefon": s.phone or "", "TelegramID": s.telegram_id or "",
+            "Fan": t.subject, "Ball": ts.score, "Foiz": ts.score_percentage, "Sana": ts.finished_at
         } for s, ts, t in rows])
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer: df.to_excel(writer, index=False)
