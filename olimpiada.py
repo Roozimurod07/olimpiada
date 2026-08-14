@@ -443,14 +443,13 @@ async def get_main_menu_keyboard():
         [KeyboardButton(text="👤 Profilim"), KeyboardButton(text="📊 Mening urinishlarim")],
         [KeyboardButton(text="⚖️ Apellyatsiya"), KeyboardButton(text="🏆 Reyting")],
         [KeyboardButton(text="ℹ️ Olimpiada haqida")],
-        [KeyboardButton(text="🚀 Start")]
+        [KeyboardButton(text="🏠 Asosiy menyu")]
     ])
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
 def get_admin_menu():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="➕ ID qo'shish")],
             [KeyboardButton(text="📂 Test yuklash"), KeyboardButton(text="🧩 Blok test yuklash")],
             [KeyboardButton(text="⚙️ Blok test holati"), KeyboardButton(text="⚙️ Testlarni boshqarish")],
             [KeyboardButton(text="💰 Pullik rejim"), KeyboardButton(text="💳 To'lov sozlamalari")],
@@ -459,14 +458,14 @@ def get_admin_menu():
             [KeyboardButton(text="📊 Jonli statistika"), KeyboardButton(text="📥 Excel natijalar")],
             [KeyboardButton(text="⚖️ Apellyatsiyalar"), KeyboardButton(text="👥 Adminlar")],
             [KeyboardButton(text="📢 Xabar yuborish"), KeyboardButton(text="🧹 Bazani tozalash")],
-            [KeyboardButton(text="🚀 Start")]
+            [KeyboardButton(text="🏠 Asosiy menyu")]
         ],
         resize_keyboard=True
     )
 
 def get_cancel_to_menu_keyboard():
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="🚀 Start")]],
+        keyboard=[[KeyboardButton(text="🏠 Asosiy menyu")]],
         resize_keyboard=True
     )
 
@@ -474,7 +473,7 @@ def get_finish_test_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="✅ Testni yakunlash va saqlash")],
-            [KeyboardButton(text="🚀 Start")]
+            [KeyboardButton(text="🏠 Asosiy menyu")]
         ],
         resize_keyboard=True
     )
@@ -647,7 +646,7 @@ async def start_profile_edit(callback: CallbackQuery, state: FSMContext):
 
 
 @router.message(ProfileEditState.waiting_for_fullname)
-async def profile_edit_fullname(message: Message, state: FSMContext, bot: Bot):
+async def profile_edit_fullname(message: Message, state: FSMContext):
     if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
         await cmd_start(message, state, bot)
         return
@@ -657,7 +656,7 @@ async def profile_edit_fullname(message: Message, state: FSMContext, bot: Bot):
 
 
 @router.message(ProfileEditState.waiting_for_age)
-async def profile_edit_age(message: Message, state: FSMContext, bot: Bot):
+async def profile_edit_age(message: Message, state: FSMContext):
     if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
         await cmd_start(message, state, bot)
         return
@@ -667,7 +666,7 @@ async def profile_edit_age(message: Message, state: FSMContext, bot: Bot):
 
 
 @router.message(ProfileEditState.waiting_for_grade)
-async def profile_edit_grade(message: Message, state: FSMContext, bot: Bot):
+async def profile_edit_grade(message: Message, state: FSMContext):
     if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
         await cmd_start(message, state, bot)
         return
@@ -677,7 +676,7 @@ async def profile_edit_grade(message: Message, state: FSMContext, bot: Bot):
 
 
 @router.message(ProfileEditState.waiting_for_school)
-async def profile_edit_school(message: Message, state: FSMContext, bot: Bot):
+async def profile_edit_school(message: Message, state: FSMContext):
     if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
         await cmd_start(message, state, bot)
         return
@@ -1983,7 +1982,7 @@ async def pay_for_specific_test(callback: CallbackQuery, state: FSMContext):
 
 @router.message(PaymentState.waiting_for_receipt, F.photo | F.document)
 async def receive_payment_receipt(message: Message, state: FSMContext, bot: Bot):
-    if message.text and message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
+    if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
         await cmd_start(message, state, bot)
         return
 
@@ -2315,10 +2314,7 @@ async def admin_add_student_prompt(message: Message, state: FSMContext):
     await message.answer("📝 Ma'lumotlarni yuboring:\n<code>Ism, Familiya, Yosh, Sinf, Maktab</code>")
 
 @router.message(AdminAddStudent.waiting_for_data)
-async def admin_save_student(message: Message, state: FSMContext, bot: Bot):
-    if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
-        await cmd_start(message, state, bot)
-        return
+async def admin_save_student(message: Message, state: FSMContext):
     if not await is_admin(message.from_user.id): return
     parts = [p.strip() for p in message.text.split(",")]
     if len(parts) < 5:
@@ -2539,6 +2535,9 @@ async def admin_ask_for_answers(message: Message, state: FSMContext):
 
 @router.message(AdminAddTest.waiting_for_questions, F.text)
 async def admin_add_bulk_questions_text(message: Message, state: FSMContext, bot: Bot):
+    if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
+        await cmd_start(message, state, bot)
+        return
     if not await is_admin(message.from_user.id):
         return
     if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
@@ -2628,7 +2627,7 @@ async def parse_and_add_questions(text: str, state: FSMContext) -> int:
     return added
 
 @router.message(AdminAddTest.waiting_for_answers)
-async def admin_save_answers_and_test(message: Message, state: FSMContext, bot: Bot):
+async def admin_save_answers_and_test(message: Message, state: FSMContext):
     if not await is_admin(message.from_user.id):
         return
     if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
@@ -3057,7 +3056,7 @@ async def send_broadcast(message: Message, state: FSMContext, bot: Bot):
     await state.clear()
     await message.answer(f"✅ Xabar {success} ta o'quvchiga yuborildi!", reply_markup=get_admin_menu())
 
-@router.message(F.text.in_(["🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"]))
+@router.message(F.text.in_(["⬅️ Bosh menyu", "🚀 Start"]))
 async def back_to_menu(message: Message, state: FSMContext, bot: Bot = None):
     """🚀 Start yoki Asosiy menyu — /start kabi qayta ishga tushirish."""
     was_in_test = await state.get_state() == TestProcessState.in_test.state
