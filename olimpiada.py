@@ -88,7 +88,7 @@ class Test(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     title = Column(String(200), nullable=False)
     subject = Column(String(100), nullable=False)
-    grade_level = Column(String(20), nullable=False)
+    grade_level = Column(Text, nullable=False)  # "5-sinf" yoki "5-sinf,6-sinf,11-sinf"
     max_attempts = Column(Integer, default=1)
     mode = Column(String(20), default="global_timer")
     duration_minutes = Column(Integer, default=180)
@@ -109,7 +109,7 @@ class Question(Base):
     test_id = Column(Integer, ForeignKey("tests.id", ondelete="CASCADE"), nullable=False)
     section_name = Column(String(100), nullable=True)
     question_text = Column(Text, nullable=False)
-    photo_file_id = Column(String(200), nullable=True)
+    photo_file_id = Column(Text, nullable=True)  # bitta id yoki JSON list
     option_a = Column(Text, nullable=False)
     option_b = Column(Text, nullable=False)
     option_c = Column(Text, nullable=True)
@@ -209,6 +209,15 @@ async def init_db():
             ))
         except Exception:
             pass
+        # grade_level / photo_file_id kengaytirish (ko'p sinf, ko'p rasm)
+        for stmt in [
+            "ALTER TABLE tests ADD COLUMN grade_level_new TEXT",
+            "UPDATE tests SET grade_level_new = grade_level",
+        ]:
+            try:
+                await conn.execute(sa_text(stmt))
+            except Exception:
+                pass
 
     async with async_session() as session:
         defaults = {
@@ -297,6 +306,93 @@ def build_school_keyboard(prefix: str = "reg", page: int = 0, per_page: int = 20
     if nav:
         rows.append(nav)
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+
+def parse_photo_ids(raw) -> list:
+    """photo_file_id dan list qaytaradi (bitta yoki JSON)."""
+    if not raw:
+        return []
+    s = str(raw).strip()
+    if s.startswith("["):
+        try:
+            data = json.loads(s)
+            if isinstance(data, list):
+                return [str(x) for x in data if x]
+        except Exception:
+            pass
+    return [s]
+
+
+def dump_photo_ids(ids: list) -> str:
+    ids = [str(x) for x in ids if x]
+    if not ids:
+        return None
+    if len(ids) == 1:
+        return ids[0]
+    return json.dumps(ids)
+
+
+def parse_grades(raw) -> list:
+    if not raw:
+        return []
+    s = str(raw).strip()
+    if s.startswith("["):
+        try:
+            data = json.loads(s)
+            if isinstance(data, list):
+                return [str(x) for x in data if x]
+        except Exception:
+            pass
+    return [g.strip() for g in s.split(",") if g.strip()]
+
+
+def dump_grades(grades: list) -> str:
+    return ",".join(grades)
+
+
+def grade_matches(test_grade_level: str, student_grade: str) -> bool:
+    if not student_grade:
+        return False
+    grades = parse_grades(test_grade_level)
+    if not grades:
+        return False
+    return student_grade in grades or test_grade_level == student_grade
+
+
+def build_admin_grade_keyboard(selected: list = None) -> InlineKeyboardMarkup:
+    selected = selected or []
+    grades = [f"{i}-sinf" for i in range(5, 12)] + ["Abituriyent"]
+    rows, row = [], []
+    for g in grades:
+        mark = "✅ " if g in selected else ""
+        row.append(InlineKeyboardButton(text=f"{mark}{g}", callback_data=f"admgr_{g}"))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="✔️ Tanlovni yakunlash", callback_data="admgr_done")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def send_question_media(bot, chat_id, photo_raw, text_content, reply_markup=None):
+    """Bitta yoki bir nechta rasm bilan savol yuborish."""
+    ids = parse_photo_ids(photo_raw)
+    if not ids:
+        return await bot.send_message(chat_id=chat_id, text=text_content, reply_markup=reply_markup)
+    if len(ids) == 1:
+        return await bot.send_photo(chat_id=chat_id, photo=ids[0], caption=text_content, reply_markup=reply_markup)
+    # media group — reply_markup alohida
+    from aiogram.types import InputMediaPhoto
+    media = []
+    for i, pid in enumerate(ids[:10]):
+        if i == 0:
+            media.append(InputMediaPhoto(media=pid, caption=text_content))
+        else:
+            media.append(InputMediaPhoto(media=pid))
+    await bot.send_media_group(chat_id=chat_id, media=media)
+    return await bot.send_message(chat_id=chat_id, text="👆 Savol rasmlari. Javobni tanlang:", reply_markup=reply_markup)
 
 
 async def get_blok_test_status() -> str:
@@ -1065,21 +1161,21 @@ async def start_test_prompt(message: Message, state: FSMContext):
             await message.answer("❌ Profilingizda sinf ko'rsatilmagan yoki ro'yxatdan o'tmagansiz.")
             return
 
-        # Oddiy testlar bepul (to'lov faqat blok testlar uchun)
-        tests = (await session.execute(
+        # Oddiy testlar bepul (to'lov faqat blok testlar uchun); ko'p sinfli testlar ham
+        all_tests = (await session.execute(
             select(Test).where(
                 Test.is_active == True,
                 Test.is_finished == False,
-                Test.grade_level == student.grade,
                 Test.is_block_test == False
             )
         )).scalars().all()
+        tests = [t for t in all_tests if grade_matches(t.grade_level, student.grade)]
 
         if not tests:
             await message.answer(f"⚠️ Hozirda <b>{student.grade}</b> uchun faol oddiy testlar mavjud emas.")
             return
 
-        keyboard_buttons = [[InlineKeyboardButton(text=f"📚 {t.subject} — {t.title}", callback_data=f"start_test_{t.id}")] for t in tests]
+        keyboard_buttons = [[InlineKeyboardButton(text=f"📚 {t.subject} — {t.title}", callback_data=f"ask_rules_test_{t.id}")] for t in tests]
         await message.answer("📝 <b>Mavjud testlar:</b>\n\nTestni tanlang:", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_buttons))
 
 @router.message(F.text == "🗂 Blok testlar")
@@ -1123,7 +1219,7 @@ async def start_block_test_prompt(message: Message, state: FSMContext):
                     mark = " 🔒"
             keyboard_buttons.append([InlineKeyboardButton(
                 text=f"🧩 {t.subject} — {t.title}{mark}",
-                callback_data=f"start_block_{t.id}"
+                callback_data=f"ask_rules_block_{t.id}"
             )])
         note = ""
         if paid_mode:
@@ -1284,10 +1380,7 @@ async def send_next_block_question(bot: Bot, chat_id: int, ts_id: int, test_id: 
 
         await state.set_state(TestProcessState.in_test)
         try:
-            if next_q.photo_file_id:
-                await bot.send_photo(chat_id=chat_id, photo=next_q.photo_file_id, caption=text_content, reply_markup=markup)
-            else:
-                await bot.send_message(chat_id=chat_id, text=text_content, reply_markup=markup)
+            await send_question_media(bot, chat_id, next_q.photo_file_id, text_content, markup)
         except Exception:
             await bot.send_message(chat_id=chat_id, text=text_content, reply_markup=markup)
         return False
@@ -1578,6 +1671,91 @@ async def finish_block_test_by_student(callback: CallbackQuery, state: FSMContex
     await callback.message.answer(f"🏆 <b>BLOK TEST YAKUNLANDI!</b>\n\nSiz to'plagan ball: <b>{ts.score}</b> ({ts.score_percentage}%).", reply_markup=main_menu)
     await callback.answer()
 
+
+@router.callback_query(F.data.startswith("ask_rules_test_"))
+async def ask_rules_before_test(callback: CallbackQuery):
+    test_id = int(callback.data.split("_")[3])
+    rules = await get_setting("test_rules", "Test qoidalariga rioya qiling.")
+    async with async_session() as session:
+        test = await session.get(Test, test_id)
+        title = test.title if test else str(test_id)
+        subject = test.subject if test else ""
+        grades = test.grade_level if test else ""
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Roziman, boshlash", callback_data=f"start_test_{test_id}")],
+        [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="rules_cancel")]
+    ])
+    await callback.message.edit_text(
+        f"📜 <b>Test qoidalari</b>\n\n📚 {subject} — {title}\nSinflar: {grades}\n\n{rules}\n\nDavom etish uchun roziligingizni bildiring.",
+        reply_markup=kb
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("ask_rules_block_"))
+async def ask_rules_before_block(callback: CallbackQuery):
+    test_id = int(callback.data.split("_")[3])
+    rules = await get_setting("test_rules", "Test qoidalariga rioya qiling.")
+    async with async_session() as session:
+        test = await session.get(Test, test_id)
+        title = test.title if test else str(test_id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Roziman, boshlash", callback_data=f"start_block_{test_id}")],
+        [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="rules_cancel")]
+    ])
+    await callback.message.edit_text(
+        f"📜 <b>Blok test qoidalari</b>\n\n🧩 {title}\n⏱ Umumiy vaqt: 180 daqiqa\n\n{rules}\n\nDavom etish uchun roziligingizni bildiring.",
+        reply_markup=kb
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "rules_cancel")
+async def rules_cancel_to_menu(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    """Bekor qilish — asosiy menyu."""
+    try:
+        await callback.message.delete()
+    except Exception:
+        try:
+            await callback.message.edit_text("Bekor qilindi.")
+        except Exception:
+            pass
+    await state.clear()
+    user_id = callback.from_user.id
+    if await is_admin(user_id):
+        await bot.send_message(user_id, "🛠 <b>Xush kelibsiz, Admin!</b>", reply_markup=get_admin_menu())
+        await callback.answer()
+        return
+    is_subscribed = await check_subscription(user_id, bot)
+    if not is_subscribed:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📢 Kanalga obuna bo'lish", url=f"https://t.me/{REQUIRED_CHANNEL.replace('@', '')}")],
+            [InlineKeyboardButton(text="✅ Obunani tekshirish", callback_data="check_sub")]
+        ])
+        await bot.send_message(
+            user_id,
+            f"⚠️ Botdan foydalanish uchun avval quyidagi kanalga obuna bo'lishingiz kerak:\n\n{REQUIRED_CHANNEL}",
+            reply_markup=keyboard
+        )
+        await callback.answer()
+        return
+    async with async_session() as session:
+        student = (await session.execute(select(Student).where(Student.telegram_id == user_id))).scalar_one_or_none()
+    if student and student.is_active:
+        main_menu = await get_main_menu_keyboard()
+        await bot.send_message(
+            user_id,
+            f"🏠 <b>Asosiy menyu</b>\n\nXush kelibsiz, <b>{student.first_name} {student.last_name}</b>!",
+            reply_markup=main_menu
+        )
+    elif student and not student.is_active:
+        await bot.send_message(user_id, "❌ Profilingiz bloklangan.")
+    else:
+        await state.set_state(SelfRegState.waiting_for_fullname)
+        await bot.send_message(user_id, "🎓 Iltimos, to'liq <b>Ism va Familiyangizni</b> kiriting:")
+    await callback.answer()
+
+
 @router.callback_query(F.data.startswith("start_test_"))
 async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bot):
     test_id = int(callback.data.split("_")[2])
@@ -1669,9 +1847,9 @@ async def begin_test_session(callback: CallbackQuery, state: FSMContext, bot: Bo
             sec_title = f"<b>Fan / Bo'lim: {q.section_name}</b>\n" if q.section_name else ""
             text_content = f"{sec_title}<b>Savol {index + 1} / {len(questions)}</b> (Ball: {q.points})\n\n{q.question_text}"
             
-            if q.photo_file_id:
-                q_msg = await bot.send_photo(chat_id=user_id, photo=q.photo_file_id, caption=text_content, reply_markup=markup)
-            else:
+            try:
+                q_msg = await send_question_media(bot, user_id, q.photo_file_id, text_content, markup)
+            except Exception:
                 q_msg = await bot.send_message(chat_id=user_id, text=text_content, reply_markup=markup)
 
             q_start_time = datetime.now(timezone.utc)
@@ -2522,23 +2700,75 @@ async def admin_get_subject(message: Message, state: FSMContext, bot: Bot):
     if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
         await cmd_start(message, state, bot)
         return
-    await state.update_data(subject=message.text.strip())
+    await state.update_data(subject=message.text.strip(), selected_grades=[])
     await state.set_state(AdminAddTest.waiting_for_grade)
-    await message.answer("Sinfni kiriting (masalan: `11-sinf`):")
+    await message.answer(
+        "📚 <b>Sinflarni tanlang</b> (bir nechtasini belgilash mumkin).\n"
+        "Tayyor bo'lgach «✔️ Tanlovni yakunlash» ni bosing:",
+        reply_markup=build_admin_grade_keyboard([])
+    )
+
+
+@router.callback_query(F.data.startswith("admgr_"))
+async def admin_toggle_grade(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    if await state.get_state() != AdminAddTest.waiting_for_grade.state:
+        await callback.answer()
+        return
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    data = await state.get_data()
+    selected = list(data.get("selected_grades") or [])
+    action = callback.data.replace("admgr_", "", 1)
+    if action == "done":
+        if not selected:
+            await callback.answer("Kamida bitta sinf tanlang!", show_alert=True)
+            return
+        grade_str = dump_grades(selected)
+        await state.update_data(grade=grade_str)
+        if data.get("is_block"):
+            await state.set_state(AdminAddTest.waiting_for_block_sub1)
+            try:
+                await callback.message.edit_text(f"✅ Sinflar: <b>{grade_str}</b>")
+            except Exception:
+                pass
+            await callback.message.answer("1-asosiy fanning nomini kiriting (masalan: Fizika yoki Biologiya):")
+        else:
+            await state.set_state(AdminAddTest.waiting_for_question_time)
+            try:
+                await callback.message.edit_text(f"✅ Sinflar: <b>{grade_str}</b>")
+            except Exception:
+                pass
+            await callback.message.answer("⏱ Har bir savol uchun vaqtni **soniyada** kiriting (masalan: `15` yoki `60`):")
+        await callback.answer()
+        return
+    # toggle grade
+    g = action
+    if g in selected:
+        selected.remove(g)
+    else:
+        selected.append(g)
+    # sort nicely
+    order = [f"{i}-sinf" for i in range(5, 12)] + ["Abituriyent"]
+    selected = [x for x in order if x in selected]
+    await state.update_data(selected_grades=selected)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=build_admin_grade_keyboard(selected))
+    except Exception:
+        await callback.message.answer("Sinflar:", reply_markup=build_admin_grade_keyboard(selected))
+    await callback.answer()
+
 
 @router.message(AdminAddTest.waiting_for_grade)
-async def admin_get_grade(message: Message, state: FSMContext, bot: Bot):
+async def admin_get_grade_text_fallback(message: Message, state: FSMContext, bot: Bot):
     if message.text in ("🏠 Asosiy menyu", "⬅️ Bosh menyu", "🚀 Start"):
         await cmd_start(message, state, bot)
         return
-    await state.update_data(grade=message.text.strip())
     data = await state.get_data()
-    if data.get("is_block"):
-        await state.set_state(AdminAddTest.waiting_for_block_sub1)
-        await message.answer("1-asosiy fanning nomini kiriting (masalan: Fizika yoki Biologiya):")
-    else:
-        await state.set_state(AdminAddTest.waiting_for_question_time)
-        await message.answer("⏱ Har bir savol uchun vaqtni **soniyada** kiriting (masalan: `15` yoki `60`):")
+    await message.answer(
+        "👆 Yuqoridagi ro'yxatdan sinf(lar)ni tanlang, so'ng «✔️ Tanlovni yakunlash» ni bosing.",
+        reply_markup=build_admin_grade_keyboard(list(data.get("selected_grades") or []))
+    )
 
 @router.message(AdminAddTest.waiting_for_question_time)
 async def admin_get_question_time(message: Message, state: FSMContext, bot: Bot):
@@ -2613,47 +2843,67 @@ async def admin_get_start_time(message: Message, state: FSMContext, bot: Bot):
 
 @router.message(AdminAddTest.waiting_for_questions, F.photo)
 async def admin_handle_photo_question(message: Message, state: FSMContext):
+    """Bir yoki bir nechta rasm (media group) — bitta savolga biriktiriladi."""
     if not await is_admin(message.from_user.id):
         return
     photo_id = message.photo[-1].file_id
     caption = (message.caption or "").strip()
     data = await state.get_data()
     q_list = data.get("questions", [])
+    pending = list(data.get("pending_photo_ids") or [])
+    # eski single pending_photo_id ni ham o'qiymiz
+    if data.get("pending_photo_id") and data["pending_photo_id"] not in pending:
+        pending.append(data["pending_photo_id"])
+
+    # media group: bir xil guruhdagi rasmlarni yig'amiz
+    mgid = getattr(message, "media_group_id", None)
+    if mgid:
+        mg_map = dict(data.get("media_group_photos") or {})
+        arr = list(mg_map.get(str(mgid), []))
+        if photo_id not in arr:
+            arr.append(photo_id)
+        mg_map[str(mgid)] = arr
+        await state.update_data(media_group_photos=mg_map)
+        # caption oxirgi rasmda bo'lishi mumkin
+        if not caption:
+            await state.update_data(pending_photo_ids=arr, pending_photo_id=None)
+            # media group tugaguncha kutamiz — keyingi matn/yoki caption
+            if len(arr) == 1:
+                await message.answer(
+                    f"📸 Rasm guruhiga qo'shildi ({len(arr)} ta). "
+                    f"Yana rasm yuborishingiz yoki savol matnini yozishingiz mumkin."
+                )
+            return
+        # caption bor — savolni yozamiz
+        pending = arr
+        mg_map.pop(str(mgid), None)
+        await state.update_data(media_group_photos=mg_map)
+    else:
+        pending.append(photo_id)
 
     parsed = parse_single_question_text(caption) if caption else None
     if parsed:
-        parsed["photo_file_id"] = photo_id
+        parsed["photo_file_id"] = dump_photo_ids(pending)
         q_list.append(parsed)
-        await state.update_data(questions=q_list)
-        await message.answer(f"📸 Rasmli savol qo'shildi! Jami savollar: {len(q_list)}")
+        await state.update_data(questions=q_list, pending_photo_ids=[], pending_photo_id=None)
+        await message.answer(f"📸 Rasmli savol qo'shildi ({len(pending)} rasm)! Jami savollar: {len(q_list)}")
     elif caption:
-        # Caption bor lekin A/B topilmadi — savol matni sifatida qabul qilamiz, variantlar default
         q_list.append({
             "text": caption,
-            "a": "A",
-            "b": "B",
-            "c": "C",
-            "d": "D",
+            "a": "A", "b": "B", "c": "C", "d": "D",
             "correct": "A",
-            "photo_file_id": photo_id
+            "photo_file_id": dump_photo_ids(pending)
         })
-        await state.update_data(questions=q_list)
+        await state.update_data(questions=q_list, pending_photo_ids=[], pending_photo_id=None)
         await message.answer(
-            f"📸 Rasmli savol qo'shildi (variantlar A–D default).\n"
-            f"Jami: {len(q_list)}\n"
-            f"⚠️ Keyin to'g'ri javoblarni alohida yuborasiz."
+            f"📸 Rasmli savol qo'shildi ({len(pending)} rasm, variantlar default).\nJami: {len(q_list)}"
         )
     else:
-        # Faqat rasm — keyingi matn bilan bog'lash uchun vaqtincha saqlash
-        await state.update_data(pending_photo_id=photo_id)
+        await state.update_data(pending_photo_ids=pending, pending_photo_id=None)
         await message.answer(
-            "📸 Rasm qabul qilindi.\n"
-            "Endi shu rasm uchun savol matni va variantlarni yuboring:\n\n"
-            "<code>Savol matni...\n"
-            "A) variant\n"
-            "B) variant\n"
-            "C) variant\n"
-            "D) variant</code>"
+            f"📸 Rasm saqlandi (jami {len(pending)} ta).\n"
+            f"Yana rasm yuborishingiz mumkin yoki savol matni + variantlarni yozing:\n\n"
+            f"<code>Savol matni...\nA) ...\nB) ...\nC) ...\nD) ...</code>"
         )
 
 @router.message(AdminAddTest.waiting_for_questions, F.document)
@@ -2707,24 +2957,34 @@ async def admin_add_bulk_questions_text(message: Message, state: FSMContext, bot
         return
 
     data = await state.get_data()
-    pending_photo = data.get("pending_photo_id")
+    pending = list(data.get("pending_photo_ids") or [])
+    if data.get("pending_photo_id") and data["pending_photo_id"] not in pending:
+        pending.append(data["pending_photo_id"])
+    # media group yakunlangan bo'lishi mumkin
+    mg_map = dict(data.get("media_group_photos") or {})
+    if mg_map:
+        for arr in mg_map.values():
+            for pid in arr:
+                if pid not in pending:
+                    pending.append(pid)
+        mg_map = {}
 
-    # Oldingi rasm bilan bog'langan bitta savol
-    if pending_photo:
+    # Oldingi rasm(lar) bilan bog'langan savol
+    if pending:
         parsed = parse_single_question_text(message.text)
         q_list = data.get("questions", [])
         if parsed:
-            parsed["photo_file_id"] = pending_photo
+            parsed["photo_file_id"] = dump_photo_ids(pending)
             q_list.append(parsed)
         else:
             q_list.append({
                 "text": message.text.strip(),
                 "a": "A", "b": "B", "c": "C", "d": "D",
                 "correct": "A",
-                "photo_file_id": pending_photo
+                "photo_file_id": dump_photo_ids(pending)
             })
-        await state.update_data(questions=q_list, pending_photo_id=None)
-        await message.answer(f"📸 Rasmli savol qo'shildi! Jami: {len(q_list)}")
+        await state.update_data(questions=q_list, pending_photo_ids=[], pending_photo_id=None, media_group_photos={})
+        await message.answer(f"📸 Rasmli savol qo'shildi ({len(pending)} rasm)! Jami: {len(q_list)}")
         return
 
     added = await parse_and_add_questions(message.text, state)
@@ -2865,7 +3125,7 @@ async def admin_save_answers_and_test(message: Message, state: FSMContext):
             ))
             
         if data.get("start_time"):
-            students = (await session.execute(select(Student).where(Student.grade == data["grade"], Student.telegram_id.is_not(None)))).scalars().all()
+            students = (await session.execute(select(Student).where(Student.telegram_id.is_not(None), Student.is_active == True))).scalars().all()
             for st in students:
                 session.add(Reminder(test_id=new_test.id, student_id=st.id, reminded=False))
                 
