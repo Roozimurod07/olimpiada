@@ -279,26 +279,27 @@ def build_age_keyboard(prefix: str = "reg") -> InlineKeyboardMarkup:
 
 
 def phone_request_keyboard() -> ReplyKeyboardMarkup:
-    """Telegram orqali telefon raqamini yuborish tugmasi."""
+    """Telegram orqali telefon raqamini yuborish tugmasi (faqat contact)."""
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📱 Telefon raqamni yuborish", request_contact=True)],
-                  [KeyboardButton(text="🏠 Asosiy menyu")]],
+        keyboard=[[KeyboardButton(text="📱 Telefon raqamni yuborish", request_contact=True)]],
         resize_keyboard=True,
         one_time_keyboard=True
     )
 
 
 def build_grade_keyboard(prefix: str = "reg") -> InlineKeyboardMarkup:
-    """5-sinf .. 11-sinf + Abituriyent (callback qisqa kod bilan)."""
-    items = [(f"{i}-sinf", str(i)) for i in range(5, 12)] + [("Abituriyent", "abitur")]
+    """5-sinf .. 11-sinf + Abituriyent."""
     rows, row = [], []
-    for label, code in items:
-        row.append(InlineKeyboardButton(text=label, callback_data=f"{prefix}_grade_{code}"))
+    for i in range(5, 12):
+        row.append(InlineKeyboardButton(text=f"{i}-sinf", callback_data=f"{prefix}_grade_{i}"))
         if len(row) == 3:
             rows.append(row)
             row = []
     if row:
         rows.append(row)
+    # Abituriyent — alohida aniq callback (reg/pedit)
+    ab_cb = "regabitur" if prefix == "reg" else "peditabitur"
+    rows.append([InlineKeyboardButton(text="🎓 Abituriyent", callback_data=ab_cb)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -845,33 +846,52 @@ async def reg_pick_age(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+
+@router.callback_query(F.data == "regabitur")
+async def reg_pick_abituriyent(callback: CallbackQuery, state: FSMContext):
+    """Abituriyent tanlandi -> majburiy telefon so'rash (maktab YO'Q, menyu YO'Q)."""
+    st = await state.get_state()
+    if st != SelfRegState.waiting_for_grade.state:
+        # Hatto state boshqacha bo'lsa ham telefon so'raymiz agar fullname/age bor bo'lsa
+        data = await state.get_data()
+        if not data.get("fullname") or not data.get("age"):
+            await callback.answer("Avval ism va yoshni kiriting. /start", show_alert=True)
+            return
+    await state.update_data(grade="Abituriyent", school="-")
+    await state.set_state(SelfRegState.waiting_for_phone)
+    try:
+        await callback.message.edit_text(
+            "✅ Holat: <b>Abituriyent</b>\n\n"
+            "Endi telefon raqamingizni yuboring."
+        )
+    except Exception:
+        pass
+    await callback.message.answer(
+        "📱 <b>Telefon raqamini yuboring</b>\n\n"
+        "Pastdagi tugmani bosing:\n"
+        "<b>📱 Telefon raqamni yuborish</b>\n\n"
+        "⚠️ Raqam yuborilmaguncha ro'yxatdan o'tish tugamaydi.",
+        reply_markup=phone_request_keyboard()
+    )
+    await callback.answer("Telefon raqamini yuboring")
+
+
 @router.callback_query(F.data.startswith("reg_grade_"))
 async def reg_pick_grade(callback: CallbackQuery, state: FSMContext):
+    """Faqat 5-11 sinf. Abituriyent alohida handlerda."""
     if await state.get_state() != SelfRegState.waiting_for_grade.state:
         await callback.answer()
         return
     code = callback.data.replace("reg_grade_", "", 1)
-    grade = grade_code_to_label(code)
-    await state.update_data(grade=grade)
-
-    # Abituriyent -> telefon (maktab so'ralmaydi)
-    if grade == "Abituriyent" or code.lower() in ("abitur", "abituriyent"):
-        await state.update_data(grade="Abituriyent", school="-")
-        await state.set_state(SelfRegState.waiting_for_phone)
-        try:
-            await callback.message.edit_text("✅ Holat: <b>Abituriyent</b>")
-        except Exception:
-            pass
-        await callback.message.answer(
-            "📱 <b>Telefon raqamingizni yuboring.</b>\n\n"
-            "Pastdagi <b>«📱 Telefon raqamni yuborish»</b> tugmasini bosing — "
-            "raqam avtomatik yuboriladi.",
-            reply_markup=phone_request_keyboard()
-        )
-        await callback.answer()
+    # Agar eski "abitur" callback kelib qolsa
+    if code.lower() in ("abitur", "abituriyent"):
+        await reg_pick_abituriyent(callback, state)
         return
-
-    # Oddiy sinf -> maktab tanlash
+    grade = grade_code_to_label(code)
+    if grade == "Abituriyent":
+        await reg_pick_abituriyent(callback, state)
+        return
+    await state.update_data(grade=grade)
     await state.set_state(SelfRegState.waiting_for_school)
     try:
         await callback.message.edit_text(
